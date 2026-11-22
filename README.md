@@ -28,7 +28,7 @@ lakeshard plan PROJECT --shards 32 --out plan.json
 lakeshard reference PROJECT --build-dir REF    # plain single-machine lake build, timed
 lakeshard build PROJECT --work WORK --workers 4 --threads 3
 lakeshard assemble PROJECT --store WORK/store --dest OUT
-lakeshard verify PROJECT --build-dir OUT --reference REF --leanchecker-jobs 8
+lakeshard verify PROJECT --build-dir OUT --reference REF --leanchecker-jobs 8 [--prefix-modules skip]
 lakeshard synth OUT --modules 200              # synthetic project for tests and benchmarks
 ```
 
@@ -110,8 +110,8 @@ A remote executor or an HTTP service would send the same job JSON.
 | Stage | What | Result |
 |---|---|---|
 | a | tiny synthetic project (tests) | `pytest`: 40 modules, 3 worker processes, static and dynamic schedules, injected failure retried, assembled build identical to `lake build`, `--no-build --rehash` and `leanchecker` pass |
-| b | one machine simulating several workers on synthetic projects with the shape of real import graphs | see `docs/stages.md` |
-| c | a real Mathlib-based project | see `docs/stages.md` |
+| b | one machine simulating several workers on synthetic projects with the shape of real import graphs | 2,613 modules: 4 workers x 3 threads, 343 s (`lake build` 278 s); 7,839 files identical; `--no-build --rehash` and `leanchecker` (2,613/2,613) pass |
+| c | a real Mathlib-based project (odd-singular-vector, 230 modules) | 4 x 2: 597 s (`lake build` 8 threads 503 s; critical path 444 s, so at most 4.65x on any number of machines); 690 files identical; `--no-build --rehash` and `leanchecker` pass |
 | d | sandboxes / remote workers | not started |
 
 ## Tests

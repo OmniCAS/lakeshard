@@ -88,7 +88,14 @@ modules alone because each batch also carried other ready modules on only 2 thre
 modules after it waited for its whole batch (11 modules). A single-machine `lake build` has
 neither effect.
 
-Correctness: VERIFY_PLACEHOLDER
+Correctness, on the assembled build directory (230 modules, 1,610 files, 418 MB, assembled in 1.0 s):
+
+- `verify --reference`: 690 `.olean`/`.ilean`/`.c` files identical to the reference, none different or missing;
+- `lake build --no-build --rehash`: "All targets up-to-date (3412 jobs)" (Mathlib included), 5.9 s;
+- `leanchecker`, 4 at a time: 229 / 229 runs accepted, 1,368 s, peak RSS 3.3 GB. The root module
+  `OddSingularVector` was skipped (`--prefix-modules skip`): its file has only 69 `import` lines and
+  no declarations, and `leanchecker OddSingularVector` would re-check all 200-odd modules below it
+  in one process (on macOS that run stalled in unmapping memory; it was stopped after 33 minutes).
 
 What this stage shows: the tool handles a real Mathlib project (dependencies shared read-only,
 outputs identical to `lake build`), and its overhead on one machine is about 19 % here. What it
