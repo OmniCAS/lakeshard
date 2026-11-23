@@ -114,6 +114,15 @@ A remote executor or an HTTP service would send the same job JSON.
 | c | a real Mathlib-based project (odd-singular-vector, 230 modules) | 4 x 2: 597 s (`lake build` 8 threads 503 s; critical path 444 s, so at most 4.65x on any number of machines); 690 files identical; `--no-build --rehash` and `leanchecker` pass |
 | d | sandboxes / remote workers | not started |
 
+## Design notes
+
+- `docs/design.zh.md` (Chinese): how others batch-build large Lean repositories (primary sources), the
+  mechanism this tool relies on, the exploration log with measurements, and the planned split between
+  infrastructure and model orchestration.
+- `docs/research/`: the research notes behind it (Omega Institute's sharded build, Isabelle's cluster
+  build, Mathlib/Lake caching, analysis tools).
+- `docs/stages.md`: measurements of stages a-c.
+
 ## Tests
 
 ```bash
