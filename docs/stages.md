@@ -434,8 +434,16 @@ Dispatch and placement, wide, 2 x 16 cores unless noted (relative to critical pa
   time, the same on one machine). Both had one cause: the HTTP servers left Nagle on, so a reply
   body written after its headers waited for the client's delayed ACK, about 40 ms per request
   on Linux (measured on one of these machines: 42 ms per upload and 41 ms per small download;
-  under 1 ms with `TCP_NODELAY`). Fixed (all three servers reply without Nagle); the Mathlib runs
-  are to be repeated with it.
+  under 1 ms with `TCP_NODELAY`). Fixed: all three servers reply without Nagle.
+- **Mathlib again, with that fix** (same machines and settings, the next round): two machines
+  1,379 s (23.0 min), one machine 2,784 s (46.4 min), 2.02 times; stock `lake build` 2,775 s.
+  The root module's fetch took 5.5 s (7,973 files) instead of 250 s; uploads 0.03 s per module
+  instead of 0.3; overhead per task outside `lean` 0.075 s instead of 0.39; 94 % of slot time
+  runs `lean` (72 % before), 3 % idle with nothing ready. Wall / bound is 1.07 on two machines
+  (CP 1,280 s, W / C 1,294 s, x = 0.99) and 1.03 on one. `lean` itself was about 10 % slower in
+  this round than in the first (W 41,405 core-s on two machines and 43,437 on one, against
+  37,156 and 39,748; the hub carried more of other users' load), which is why one machine got
+  no faster and why 23 min is above the 19 min predicted from the first round's speeds.
 - First ready first on Mathlib, 2 x 16 cores: 1,766 s, 10 % slower than critical path first
   (all but the root module done at 1,521 s against 1,352 s, 12.5 % slower).
 - Stock `lake build` on the hub, 16 threads: wide 697 s (lakeshard: one machine 671, two 359, i.e.
