@@ -170,6 +170,8 @@ class BuildConfig:
     keep_setup: bool = False  # keep each module's .setup.json next to its .c file (as Lake does)
     fingerprint: str = ""  # sha256 of the coordinator's environment fingerprint; workers must match it
     lakefile_toml: str = ""  # the TOML translation of a lakefile.lean project (workers load it from here)
+    lakefile_data: dict = field(default_factory=dict)  # the parsed configuration (workers without tomllib)
+    fetch_delay_s: float = 0.0  # experiments: extra latency added to every task that fetches imports
 
     @staticmethod
     def from_dict(d: dict) -> "BuildConfig":
