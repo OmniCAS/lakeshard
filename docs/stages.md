@@ -292,6 +292,25 @@ back (`lakeshard restore W/cache --checkout <fresh checkout>`):
 | a fresh checkout with the cache is not recompiled | sources copied to another path, dependencies put in place as from their cache; `restore`: 1,610 files, 417 MB, 1.9 s, fingerprint matches; `lake build --no-build` passes; a plain `lake build` then compiles 0 modules (1.0 s, logs replayed) |
 | one edited file rebuilds only what it affects | a theorem appended to a module with 3 importers: 4 modules rebuilt (it and its 3 importers), 226 from the store; build 17.4 s, seal 2.6 s, pack 0.3 s, 20.2 s in all |
 
+### Roadmap step 1 on a public repository (PFR, Lean v4.36.0-rc2, one machine)
+
+PFR (76 modules, `lakefile.toml`, depends on Mathlib and on AddCombi, which Mathlib's cache does
+not cover). Reference: plain `lake build`, 58 s on 12 cores (including AddCombi from source).
+`check-setup`: 76 / 76 identical on Lake 4.36 (its import walk is the 4.35 one).
+
+| criterion | measured |
+|---|---|
+| a build killed midway resumes | killed at 11 s with 41 of 76 modules done; the same command: 41 from the store, 35 built, 52.8 s |
+| outputs identical to plain Lake | 516 / 516 files; `lake build --no-build --rehash`: all 7,178 jobs up to date |
+| a fresh checkout with the cache is not recompiled | sources at another path, Mathlib and its dependencies as from Mathlib's cache, AddCombi built there with plain `lake build AddCombi` (14 modules); `restore`: 1,108 files, 90 MB, 0.6 s, environment matches; `lake build --no-build` passes; a plain `lake build` then compiles 0 modules |
+| one edited file rebuilds only what it affects | a module with 3 importers: 4 rebuilt, 72 from the store, 21.0 s |
+
+Two fixes came out of this run: the dependency part of the environment fingerprint now covers only
+the dependency modules the project imports (a consumer who builds more of AddCombi still matches,
+any change to an imported dependency module still differs), and the cache copies files instead
+of hard-linking them (Lake rewrites sealed files in place on the next seal, which had changed a
+cache object under its sha256 name; `restore` caught it).
+
 ## Experiment E1: is building on several machines faster? (three, then two machines)
 
 Machines: three servers with AMD EPYC 7502 (2 x 32 cores, SMT), shared with other users' jobs.

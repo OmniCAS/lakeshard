@@ -172,6 +172,7 @@ class BuildConfig:
     lakefile_toml: str = ""  # the TOML translation of a lakefile.lean project (workers load it from here)
     lakefile_data: dict = field(default_factory=dict)  # the parsed configuration (workers without tomllib)
     fetch_delay_s: float = 0.0  # experiments: extra latency added to every task that fetches imports
+    targets: list[str] = field(default_factory=list)  # --target modules (empty: the default targets)
 
     @staticmethod
     def from_dict(d: dict) -> "BuildConfig":

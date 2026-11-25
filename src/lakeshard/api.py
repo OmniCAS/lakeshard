@@ -149,7 +149,7 @@ def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int =
     hist_in = load_history(history) if history else load_history(hist_out)
     costs = estimate_costs(g, hist_in)
     t_prep = time.time()
-    fp = env_fingerprint(proj, tb)
+    fp = env_fingerprint(proj, tb, g)
     keys = module_keys(g, proj, fp["sha256"])
     if token_file and os.path.exists(token_file):
         token = open(token_file, encoding="utf-8").read().strip()
@@ -176,7 +176,8 @@ def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int =
                       lakefile_toml=open(proj.lakefile, encoding="utf-8").read()
                       if os.path.basename(proj.lakefile) != "lakefile.toml" or
                       os.path.dirname(proj.lakefile) != proj.project_dir else "",
-                      lakefile_data=_parsed_config(proj.lakefile), fetch_delay_s=fetch_delay_s)
+                      lakefile_data=_parsed_config(proj.lakefile), fetch_delay_s=fetch_delay_s,
+                      targets=list(targets or []))
     sched = ModuleScheduler(g, costs, retries=retries, lease_s=lease_s, timeout_s=timeout_s,
                             heavy_cost=heavy_cost if heavy_cost is not None else float("inf"),
                             heavy_threads=heavy_threads, needs_closure=storage == "store", fail_once=fail_once,
@@ -354,7 +355,7 @@ def run(repo: str, work_dir: str, rev: str | None = None, checkout: str | None =
         bman = json.load(fh)
     t = time.time()
     cache_dir = os.path.abspath(cache_dir or os.path.join(work_dir, "cache"))
-    out["cache"] = pack(proj, g, sealed, cache_dir, bman["fingerprint"], bman["modules"], source)
+    out["cache"] = pack(proj, g, sealed, cache_dir, bman["fingerprint"], bman["modules"], source, targets)
     phases["pack_s"] = round(time.time() - t, 2)
     out["ok"] = True
     phases["total_s"] = round(sum(v for k, v in phases.items() if k != "total_s"), 2)
