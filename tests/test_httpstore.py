@@ -59,3 +59,16 @@ def test_server_checks_names_and_token(server):
     assert r.status == 401
     with pytest.raises(ConnectionError):
         HttpStore(url, token="wrong", retries=0).get_records(["M"])
+
+
+def test_servers_send_replies_without_nagle(server, tmp_path):
+    # With Nagle on, a reply body written after its headers waits for the client's delayed ACK:
+    # about 40 ms per request on Linux (0.3 s per published module, 33 ms per fetched file).
+    from lakeshard.forward import serve as forward_serve
+    srv, _, _ = server
+    assert srv.RequestHandlerClass.disable_nagle_algorithm is True
+    fw = forward_serve("127.0.0.1:0", None, None)
+    try:
+        assert fw.RequestHandlerClass.disable_nagle_algorithm is True
+    finally:
+        fw.server_close()

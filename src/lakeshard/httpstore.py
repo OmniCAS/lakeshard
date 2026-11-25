@@ -35,6 +35,9 @@ from .store import ArtifactStore, IntegrityError, LocalStore, sha256_file
 PREFIX = "/v1/store"
 OBJ_RE = re.compile(r"^/objects/([0-9a-f]{64})$")
 CHUNK = 1 << 20
+# Send replies at once: with Nagle on, the body written after the headers waits for the client's
+# delayed ACK (about 40 ms per request on Linux; measured 42 ms per upload, under 1 ms without).
+NO_NAGLE = True
 
 
 class StoreEndpoints:
@@ -156,6 +159,7 @@ def serve_store(root: str, host: str = "127.0.0.1", port: int = 0, token: str | 
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        disable_nagle_algorithm = NO_NAGLE
 
         def log_message(self, *args):
             pass

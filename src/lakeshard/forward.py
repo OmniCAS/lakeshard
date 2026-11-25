@@ -29,7 +29,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .direct import wait_visible
-from .httpstore import _send_json, authorized
+from .httpstore import NO_NAGLE, _send_json, authorized
 
 SHIM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "forwardshim.py")
 
@@ -88,6 +88,7 @@ def serve(listen: str, token: str | None, log_path: str | None):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        disable_nagle_algorithm = NO_NAGLE
 
         def log_message(self, *a):
             pass

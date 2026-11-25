@@ -36,7 +36,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .direct import wait_visible
-from .httpstore import StoreEndpoints, _discard_body
+from .httpstore import NO_NAGLE, StoreEndpoints, _discard_body
 from .project import ProjectGraph
 from .protocol import BuildConfig, ModuleResult, dumps, to_dict
 from .scheduler import ModuleScheduler, lower_bound
@@ -82,6 +82,7 @@ class BuildService:
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            disable_nagle_algorithm = NO_NAGLE
 
             def log_message(self, *args):  # quiet
                 pass

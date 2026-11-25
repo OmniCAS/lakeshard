@@ -113,3 +113,8 @@ def test_lost_worker_is_replaced(service):
     # the dead worker's late report is ignored
     late = ModuleResult(lost[0]["task_id"], lost[0]["module"], "dead", True, outputs=_outputs(build, lost[0]["module"]))
     assert _post(svc.url, "/v1/report", {"result": late})["accepted"] is False
+
+
+def test_service_replies_without_nagle(service):
+    svc, _, _ = service
+    assert svc.httpd.RequestHandlerClass.disable_nagle_algorithm is True

@@ -430,8 +430,14 @@ Dispatch and placement, wide, 2 x 16 cores unless noted (relative to critical pa
   done at 1,352 s (wall / bound 1.16, 2.0 times faster than one machine); the last one, the root
   module `Mathlib` that imports everything, then spent 250 s fetching 7,525 files (610 MB) that
   the other machine had built, one file at a time, before 3.7 s of `lean`. That tail is almost
-  all of the run's idle slot time (17 %); fetching imports in parallel or in one batch is the fix.
-  Uploading outputs costs 0.3 s per module (5 % of slot time, the same on one machine).
+  all of the run's idle slot time (17 %). Uploading outputs cost 0.3 s per module (5 % of slot
+  time, the same on one machine). Both had one cause: the HTTP servers left Nagle on, so a reply
+  body written after its headers waited for the client's delayed ACK, about 40 ms per request
+  on Linux (measured on one of these machines: 42 ms per upload and 41 ms per small download;
+  under 1 ms with `TCP_NODELAY`). Fixed (all three servers reply without Nagle); the Mathlib runs
+  are to be repeated with it.
+- First ready first on Mathlib, 2 x 16 cores: 1,766 s, 10 % slower than critical path first
+  (all but the root module done at 1,521 s against 1,352 s, 12.5 % slower).
 - The one-machine `lake build` of the wide instance on the hub lost its timing (the harness's SSH
   session dropped; about 13 minutes by file times) and is repeated at the end of the queue.
 
