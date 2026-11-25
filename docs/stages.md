@@ -378,6 +378,21 @@ Third instance: narrow, 2,613 modules, W 1,748 core-s, CP 382 s, W / CP 4.6 (Lak
 | narrow | 16 | 439 (`lake build`: 440) | 439 | 1.00 (1.03) | 7.2 | 1.16 |
 | narrow | 4 | 689 | 540 | 1.28 (1.26) | 1.8 | 1.40 |
 
+The table above is the first round, before the servers' Nagle fix (below: about 40 ms per store
+request). Second round, with the fix, same machines and settings:
+
+| instance | cores per machine | one machine s | two machines s | two vs one (predicted) | wall / bound, two machines |
+|---|---:|---:|---:|---:|---:|
+| wide | 16 | 635 | 329 | 1.93 (2.04) | 1.10 |
+| wide | 8 | 1,214 | 627 | 1.94 (2.09) | 1.05 |
+| wide | 4 | 2,370 | 1,196 | 1.98 (2.11) | 1.03 |
+| narrow | 16 | 461 | 439 | 1.05 (1.03) | 1.04 |
+| narrow | 4 | 671 | 486 | 1.38 (1.26) | 1.25 |
+| all of Mathlib | 16 | 2,784 | 1,379 | 2.02 (19 min predicted for two machines; 23.0 measured) | 1.07 |
+
+The fix took 5-10 % off the wide runs on either one or two machines and 14 % off Mathlib on two
+(where the transfers were on the critical path); the third round is running.
+
 Dispatch and placement, wide, 2 x 16 cores unless noted (relative to critical path first, 359 s):
 
 | configuration | wall s | slower by (predicted) |
