@@ -415,13 +415,23 @@ Dispatch and placement, wide, 2 x 16 cores unless noted (relative to critical pa
   dynamic run the delay also lengthens the critical path. Dispatch that ignores where the
   imports are is right on a fast network only; with slow transfers placement must count them.
 - The forwarding control (`lakeshard forward`, distcc-style; Lake schedules, 32 commands allowed
-  in flight) took 909 s: every module's `lean` took about 1 s longer (median; 1.40-1.48 times
+  in flight) took 909 s: every module's `lean` took about 1 s longer (median; 1.40-1.49 times
   for modules over 1 s) because imports are read over NFS, so total work was 14,551 core-s
   against 9,447 with per-machine directories (+54 %); and Lake kept a median of only 18 commands
   in flight, never 32, although the graph is wide, so half of the slot time was idle (Lake's
   own work on the NFS build directory, hashing outputs and writing traces, is the likely cause;
   not measured separately). Waiting for files to become visible over NFS took 0.02 s per command
   (median). Outputs per machine plus an artifact store are 2.5 times faster on the same machines.
+- **All of Mathlib** (8,530 modules, Lean v4.34.0, one `lean` thread per module, 16 cores per
+  machine): one machine 2,713 s (45.2 min, wall / bound 1.09); two machines 1,606 s (26.8 min,
+  1.69 times faster; predicted about 19 min). W 37,156 core-s against 39,748 on one machine
+  (6.5 % smaller: both machines ran the same modules 5-8 % faster than the one-machine run did,
+  hub 0.95, second machine 0.92), CP 1,119 s, x = 0.96, bound 1,161 s. Every module but one was
+  done at 1,352 s (wall / bound 1.16, 2.0 times faster than one machine); the last one, the root
+  module `Mathlib` that imports everything, then spent 250 s fetching 7,525 files (610 MB) that
+  the other machine had built, one file at a time, before 3.7 s of `lean`. That tail is almost
+  all of the run's idle slot time (17 %); fetching imports in parallel or in one batch is the fix.
+  Uploading outputs costs 0.3 s per module (5 % of slot time, the same on one machine).
 - The one-machine `lake build` of the wide instance on the hub lost its timing (the harness's SSH
   session dropped; about 13 minutes by file times) and is repeated at the end of the queue.
 
