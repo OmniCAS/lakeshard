@@ -278,13 +278,26 @@ class LakeWorkspace:
     def leanir_command(self, outputs: dict[str, str], setup_path: str) -> list[str]:
         return [os.path.join(self.toolchain_bin, "leanir"), setup_path, outputs[".ir"], outputs[".c"]]
 
-    def check_supported(self) -> None:
-        bad = list(self.proj.unsupported) + [u for lib in self.proj.libs for u in lib.unsupported]
+    def check_supported(self, graph=None) -> None:
+        """Refuse settings the direct backend does not reproduce, in the libraries that are built."""
+        used = {self.proj.lib_of(m).name for m in graph.modules if self.proj.lib_of(m)} if graph else None
+        bad = list(self.proj.unsupported) + [u for lib in self.proj.libs if used is None or lib.name in used
+                                             for u in lib.unsupported]
         if bad:
             raise ProjectError("the direct lean backend does not reproduce these Lake settings: " + ", ".join(bad))
-        for p in self.deps:
-            if not os.path.isdir(p.lib_dir):
-                raise ProjectError(f"dependency {p.name} is not built ({p.lib_dir} missing; e.g. `lake exe cache get`)")
+
+    def check_imports(self, graph) -> None:
+        """Every import from outside the project must be a built module of a dependency or of Lean
+        itself (a dependency nothing imports, e.g. one used only by a tool, need not be built)."""
+        core = os.path.join(os.path.dirname(self.toolchain_bin), "lib", "lean")
+        missing = []
+        for info in graph.modules.values():
+            for x in info.external:
+                if self.locate(x) is None and not os.path.exists(os.path.join(core, module_rel(x) + ".olean")):
+                    missing.append(x)
+        if missing:
+            raise ProjectError(f"{len(set(missing))} imported modules are neither built in a dependency nor part of "
+                               f"Lean, e.g. {sorted(set(missing))[:3]} (dependencies not built? e.g. `lake exe cache get`)")
 
 
 def _norm_arts(arts: dict) -> dict:

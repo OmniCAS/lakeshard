@@ -42,8 +42,9 @@ def test_random_runs_with_failures(tmp_path):
         for w in ("a", "b", "c"):
             s.register(w, 2, 0.0)
         disp = _simulate(g, s, ["a", "b", "c"], lambda m, a, w: m in bad or (m in flaky and a == 1), rnd)
-        for m in bad:  # failed after 3 attempts, or skipped because an import failed first
-            assert (s.state[m] == "failed" and disp[m] == 3) or (s.state[m] == "skipped" and m not in disp)
+        for m in bad:  # failed on two different workers (a source problem), or skipped: an import failed first
+            assert ((s.state[m] == "failed" and disp[m] == 2 and s.failure_class[m] == "source")
+                    or (s.state[m] == "skipped" and m not in disp))
             for d in g.modules:  # everything importing a failed module is skipped
                 if m in g.closure([d]):
                     assert s.state[d] in ("skipped", "failed")
@@ -75,8 +76,41 @@ def test_retry_goes_to_another_worker_when_possible(tmp_path):
     assert m not in [x.module for x in again]  # held for b
     (t2,) = [x for x in s.claim("b", 5, 1.0) if x.module == m]
     assert t2.attempt == 2
-    s.complete(t2.task_id, False, 2.0, "x")  # failed on both workers: anyone may take it now
-    assert m in [x.module for x in s.claim("a", 5, 2.0)]
+    ev = s.complete(t2.task_id, False, 2.0, "x")  # failed on two different workers: a source problem
+    assert ev["action"] == "failed" and ev["class"] == "source" and s.state[m] == "failed"
+
+
+def test_single_worker_retries_until_exhausted(tmp_path):
+    g = _graph(tmp_path, 3, max_imports=1)
+    s = ModuleScheduler(g, {m: 1.0 for m in g.modules}, retries=2)
+    s.register("a", 1, 0.0)
+    (t,) = s.claim("a", 1, 0.0)
+    for k in range(3):
+        ev = s.complete(t.task_id, False, k + 1.0, "x")
+        if k < 2:
+            (t,) = s.claim("a", 1, k + 1.0)  # nobody else: the same worker tries again
+            assert t.attempt == k + 2
+    assert ev["class"] == "retries exhausted"
+
+
+def test_cached_modules_and_invalidate(tmp_path):
+    g = _graph(tmp_path, 30, max_imports=2, locality=4)
+    roots = [m for m in g.order if not g.modules[m].imports]
+    first = g.order[: len(g.order) // 2]
+    keys = {m: f"k-{m}" for m in g.modules}
+    s = ModuleScheduler(g, {m: 1.0 for m in g.modules}, keys=keys, done=set(first), needs_closure=True)
+    s.register("a", 100, 0.0)
+    assert all(s.state[m] == "done" for m in first) and s.cached == set(first)
+    tasks = s.claim("a", 100, 0.0)
+    assert tasks and not {t.module for t in tasks} & set(first)
+    for t in tasks:
+        assert t.key == keys[t.module] and set(t.needs) == {keys[u] for u in g.closure([t.module])}
+    # a cached root turns out corrupt: it is rebuilt, and its waiting importers wait for it
+    r = roots[0]
+    waiting = [c for c in s.children[r] if s.state[c] == "waiting"]
+    assert s.invalidate(r, 1.0) and s.state[r] == "ready"
+    assert all(s.state[c] == "waiting" for c in waiting)
+    assert r in [t.module for t in s.claim("a", 100, 1.0)]
 
 
 def test_lost_worker_and_cancel(tmp_path):

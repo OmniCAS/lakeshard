@@ -42,17 +42,25 @@ class FileRef:
 
 @dataclass
 class ModuleRecord:
-    """All build outputs of one module (olean, ilean, c, Lake trace and hash files...)."""
+    """All build outputs of one module (olean, ilean, c, Lake trace and hash files...).
+
+    `key`: the module's input key (direct backend; see `fingerprint.py`). The store files a record
+    under its key when it has one, otherwise under the module name (Lake batch backend)."""
 
     module: str
     files: list[FileRef]
     worker: str = ""
     shard: str = ""
+    key: str = ""
 
     @staticmethod
     def from_dict(d: dict) -> "ModuleRecord":
         return ModuleRecord(d["module"], [FileRef.from_dict(x) for x in d["files"]],
-                            d.get("worker", ""), d.get("shard", ""))
+                            d.get("worker", ""), d.get("shard", ""), d.get("key", ""))
+
+    @property
+    def ident(self) -> str:
+        return self.key or self.module
 
     def digest(self) -> str:
         return ",".join(f"{f.path}:{f.sha256}" for f in sorted(self.files, key=lambda f: f.path))
@@ -160,6 +168,8 @@ class BuildConfig:
     visibility_poll_s: float = 0.5
     heartbeat_s: float = 5.0
     keep_setup: bool = False  # keep each module's .setup.json next to its .c file (as Lake does)
+    fingerprint: str = ""  # sha256 of the coordinator's environment fingerprint; workers must match it
+    lakefile_toml: str = ""  # the TOML translation of a lakefile.lean project (workers load it from here)
 
     @staticmethod
     def from_dict(d: dict) -> "BuildConfig":
@@ -173,7 +183,8 @@ class ModuleTask:
     attempt: int = 1
     threads: int = 0  # LEAN_NUM_THREADS for this module; 0 = the worker's default
     timeout_s: float = 7200.0
-    needs: list[str] = field(default_factory=list)  # storage=store: import closure to fetch first
+    needs: list[str] = field(default_factory=list)  # storage=store: keys (or names) of the import closure
+    key: str = ""  # the module's input key: its record is filed under it
     fail_on_purpose: bool = False  # test hook: report a failure without running lean
 
     @staticmethod
@@ -207,6 +218,7 @@ class ModuleResult:
     lean_end: float = 0.0
     ended: float = 0.0
     fetched_files: int = 0
+    corrupt: list[str] = field(default_factory=list)  # store records whose objects failed their sha256
 
     @staticmethod
     def from_dict(d: dict) -> "ModuleResult":

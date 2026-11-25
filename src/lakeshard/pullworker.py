@@ -99,10 +99,19 @@ class PullWorker:
     def run(self) -> int:
         os.makedirs(self.workspace, exist_ok=True)
         t_send = time.time()
-        resp = self._post("/v1/register", {"worker": self.id, "slots": self.slots, "threads": self.threads,
-                                           "host": socket.gethostname(), "pid": os.getpid()})
+        resp = self._post("/v1/config", {"worker": self.id})
         self._clock_sample(t_send, time.time(), resp.get("server_time"))
         cfg = BuildConfig.from_dict(resp["config"])
+        fp = None
+        if cfg.fingerprint:  # prove that this machine's environment is the coordinator's
+            from .direct import load_worker_project
+            from .fingerprint import fingerprint
+            fp = fingerprint(load_worker_project(cfg, self.workspace), cfg.toolchain_bin)
+        resp = self._post("/v1/register", {"worker": self.id, "slots": self.slots, "threads": self.threads,
+                                           "host": socket.gethostname(), "pid": os.getpid(), "fingerprint": fp})
+        if resp.get("refused"):
+            print(f"worker {self.id}: refused by the coordinator: {json.dumps(resp['refused'])}", file=sys.stderr)
+            return 3
         self.builder = ModuleBuilder(cfg, self.id, self.workspace, self.threads, token=self.token)
         hb = threading.Thread(target=self._heartbeats, args=(cfg.heartbeat_s,), daemon=True)
         hb.start()
@@ -125,6 +134,9 @@ class PullWorker:
                     t = threading.Thread(target=self._run_task, args=(task,), daemon=True)
                     t.start()
                     workers.append(t)
+                if resp.get("refused"):
+                    print(f"worker {self.id}: refused: {json.dumps(resp['refused'])}", file=sys.stderr)
+                    return 3
                 if resp.get("shutdown"):
                     break
         except CoordinatorUnreachable as e:

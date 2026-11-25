@@ -55,3 +55,15 @@ def test_split_prefix_modules():
     from lakeshard.verify import split_prefix_modules
     mods = ["Foo", "Foo.A", "Foo.A.B", "Bar.X", "Bar.Y", "FooBar"]
     assert split_prefix_modules(mods) == (["Foo.A.B", "Bar.X", "Bar.Y", "FooBar"], ["Foo", "Foo.A"])
+
+
+def test_graph_of_chosen_targets(tmp_path):
+    write_project(str(tmp_path), random_dag(60, max_imports=3, locality=5))
+    p = LakeProject.load(str(tmp_path))
+    full = p.graph()
+    top = full.order[-1]
+    g = p.graph([top])
+    assert set(g.modules) == {top} | full.closure([top]) and g.targets == [top]
+    import pytest
+    with pytest.raises(Exception, match="no source file"):
+        p.graph(["Synth.Nope"])

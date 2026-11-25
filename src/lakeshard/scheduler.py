@@ -15,6 +15,12 @@ States: `waiting` (some import not done) -> `ready` -> `running` -> `done`, or `
   someone else is told to cancel them.
 - Heavy modules (estimated cost >= `heavy_cost`) can be given `heavy_threads` Lean threads; the
   rule is only a parameter for now (no tuning).
+- `done`: modules whose outputs the store already has for their current input key (resume,
+  incremental rebuild); they start as done and are never dispatched.
+- Failure classes: a module that fails with an error on `source_failure_workers` different workers
+  is a source problem and fails at once (its importers are skipped); lost workers, overdue tasks
+  and corrupt inputs do not count towards that. `invalidate(m)` puts a done module back (its stored
+  outputs turned out corrupt) so that it is rebuilt before its waiting importers.
 """
 from __future__ import annotations
 
@@ -40,13 +46,19 @@ class Running:
 class ModuleScheduler:
     def __init__(self, graph: ProjectGraph, costs: dict[str, float], retries: int = 2, lease_s: float = 60.0,
                  timeout_s: float = 7200.0, threads: int = 0, heavy_cost: float = math.inf, heavy_threads: int = 0,
-                 needs_closure: bool = False, fail_once: set | None = None, overdue_grace_s: float = 120.0):
+                 needs_closure: bool = False, fail_once: set | None = None, overdue_grace_s: float = 120.0,
+                 keys: dict[str, str] | None = None, done: set | None = None, source_failure_workers: int = 2):
         self.g, self.costs = graph, costs
         self.retries, self.lease_s, self.timeout_s = retries, lease_s, timeout_s
         self.threads, self.heavy_cost, self.heavy_threads = threads, heavy_cost, heavy_threads
         self.needs_closure = needs_closure
         self.fail_once = set(fail_once or ())
         self.overdue_grace_s = overdue_grace_s
+        self.keys = keys or {}
+        self.source_failure_workers = source_failure_workers
+        self.cached = set(done or ()) & set(graph.modules)
+        self.failure_class: dict[str, str] = {}
+        self.error_workers: dict[str, set] = defaultdict(set)
         self.children = graph.children()
         self.bl: dict[str, float] = {}
         for m in reversed(graph.order):
@@ -63,8 +75,13 @@ class ModuleScheduler:
         self.ready_at: dict[str, float | None] = {}  # when each module last became ready (None: at start)
         self._seq = itertools.count(1)
         self._terminal = 0
+        for m in self.cached:
+            self.state[m] = "done"
+            self._terminal += 1
+        for m in graph.modules:
+            self.indeg[m] = sum(1 for u in graph.modules[m].imports if u not in self.cached)
         for m, d in self.indeg.items():
-            if d == 0:
+            if d == 0 and self.state[m] == "waiting":
                 self._make_ready(m)
 
     # --- workers
@@ -115,16 +132,18 @@ class ModuleScheduler:
     def _start(self, m: str, worker: str, now: float) -> ModuleTask:
         self.attempts[m] += 1
         heavy = self.heavy_threads and self.costs[m] >= self.heavy_cost
+        clos = sorted(self.g.closure([m])) if self.needs_closure else []
         task = ModuleTask(task_id=f"t{next(self._seq):07d}", module=m, attempt=self.attempts[m],
                           threads=self.heavy_threads if heavy else self.threads, timeout_s=self.timeout_s,
-                          needs=sorted(self.g.closure([m])) if self.needs_closure else [],
+                          needs=[self.keys.get(u, u) for u in clos], key=self.keys.get(m, ""),
                           fail_on_purpose=m in self.fail_once and self.attempts[m] == 1)
         self.state[m] = "running"
         self.running[task.task_id] = Running(task, worker, now)
         return task
 
-    def complete(self, task_id: str, ok: bool, now: float, error: str = "") -> dict | None:
-        """Apply a task's outcome. Returns what happened, or None for a stale task (already reassigned)."""
+    def complete(self, task_id: str, ok: bool, now: float, error: str = "", kind: str = "error") -> dict | None:
+        """Apply a task's outcome. Returns what happened, or None for a stale task (already reassigned).
+        `kind` of a failure: "error" (lean or the worker failed), "lost", "overdue", "corrupt"."""
         r = self.running.pop(task_id, None)
         if r is None:
             return None
@@ -143,15 +162,43 @@ class ModuleScheduler:
             return ev
         self.avoid[m].add(r.worker)
         self.errors[m].append(error[:500])
-        if self.attempts[m] <= self.retries:
-            self._make_ready(m, now)
-            ev["action"] = "retry"
+        if kind == "error":
+            self.error_workers[m].add(r.worker)
+        ev["kind"] = kind
+        if kind == "corrupt":
+            self.attempts[m] -= 1  # not this module's fault: an import's stored outputs were bad
+        if len(self.error_workers[m]) >= self.source_failure_workers:
+            cls = "source"  # the same module fails on different machines: not the environment
+        elif self.attempts[m] > self.retries:
+            cls = "retries exhausted"
         else:
-            self.state[m] = "failed"
-            self._terminal += 1
-            ev["action"] = "failed"
-            ev["skipped"] = self._skip_down(m)
+            if self.indeg[m] > 0:  # an import was invalidated meanwhile: wait for its rebuild
+                self.state[m] = "waiting"
+            else:
+                self._make_ready(m, now)
+            ev["action"] = "retry"
+            return ev
+        self.state[m] = "failed"
+        self.failure_class[m] = cls
+        self._terminal += 1
+        ev["action"] = "failed"
+        ev["class"] = cls
+        ev["skipped"] = self._skip_down(m)
         return ev
+
+    def invalidate(self, m: str, now: float) -> bool:
+        """A done module's stored outputs are unusable: build it again before its waiting importers."""
+        if self.state.get(m) != "done":
+            return False
+        self.cached.discard(m)
+        self._terminal -= 1
+        for c in self.children[m]:
+            if self.state[c] in ("waiting", "ready", "running"):
+                self.indeg[c] += 1
+                if self.state[c] != "running":  # a running importer waits once its attempt ends
+                    self.state[c] = "waiting"  # (a stale heap entry of a ready importer is skipped)
+        self._make_ready(m, now)
+        return True
 
     def _skip_down(self, m: str) -> int:
         n = 0
@@ -172,13 +219,14 @@ class ModuleScheduler:
             if info["alive"] and now - info["last_seen"] > self.lease_s:
                 info["alive"] = False
                 for tid in [t for t, r in self.running.items() if r.worker == wid and t not in self.confirming]:
-                    ev = self.complete(tid, False, now, f"worker {wid} lost (no heartbeat for {self.lease_s:.0f} s)")
+                    ev = self.complete(tid, False, now, f"worker {wid} lost (no heartbeat for {self.lease_s:.0f} s)",
+                                       kind="lost")
                     if ev:
                         ev["reason"] = "worker lost"
                         out.append(ev)
         for tid, r in list(self.running.items()):
             if tid not in self.confirming and now - r.started > r.task.timeout_s + self.overdue_grace_s:
-                ev = self.complete(tid, False, now, f"task overdue ({now - r.started:.0f} s)")
+                ev = self.complete(tid, False, now, f"task overdue ({now - r.started:.0f} s)", kind="overdue")
                 if ev:
                     ev["reason"] = "overdue"
                     out.append(ev)

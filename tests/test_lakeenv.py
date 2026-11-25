@@ -115,10 +115,14 @@ def test_module_system_matches_lake(tmp_path):
     assert ref["ok"], ref
     res = api.check_setup(str(proj), str(tmp_path / "ref"))
     assert res["ok"] and res["checked_setup_files"] == 6, res
-    rep = api.build_direct(str(proj), str(tmp_path / "work"), workers=2, slots=2)
-    assert rep["ok"], rep
-    asm = api.assemble(str(proj), rep["store_root"], str(tmp_path / "assembled"))
-    assert asm["ok"], asm
-    ver = api.verify(str(proj), str(tmp_path / "assembled"), reference=str(tmp_path / "ref"), lake_check=False)
+    res = api.run(str(proj), str(tmp_path / "work"), workers=2, slots=2)  # build, seal, pack
+    assert res["ok"] and res["seal"]["from_store"] == 6 and res["seal"]["no_build_check"]["ok"], res
+    sealed = tmp_path / "work" / "sealed"
+    ver = api.verify(str(proj), str(sealed), reference=str(tmp_path / "ref"))  # includes lake --no-build --rehash
     # 4 module files x 7 outputs (.olean .olean.server .olean.private .ilean .ir .ir.sig .c) + 2 plain x 3
     assert ver["compare"]["ok"] and ver["compare"]["identical_files"] == 34, ver
+    assert ver["lake_no_build"]["ok"], ver
+    for rel in ("ModSys/C", "ModSys/D", "Extra/X"):  # Lake's own input hashes
+        a = json.load(open(sealed / "lib" / "lean" / (rel + ".trace")))
+        b = json.load(open(tmp_path / "ref" / "lib" / "lean" / (rel + ".trace")))
+        assert a["depHash"] == b["depHash"]

@@ -87,7 +87,7 @@ def glob_matches(glob: str, mod: str) -> bool:
 
 # Lake configuration keys the direct-`lean` backend does not reproduce (it refuses to run then).
 DIRECT_UNSUPPORTED_KEYS = ("precompileModules", "dynlibs", "plugins", "extraDepTargets", "needs",
-                           "nativeFacets", "defaultFacets", "platformIndependent")
+                           "nativeFacets", "defaultFacets")
 
 
 @dataclass
@@ -190,13 +190,21 @@ class LakeProject:
     unsupported: list[str] = field(default_factory=list)  # keys the direct backend cannot reproduce
 
     @staticmethod
-    def load(project_dir: str) -> "LakeProject":
+    def load(project_dir: str, config: str | None = None) -> "LakeProject":
+        """Read `lakefile.toml`, or `config`, or for a `lakefile.lean` project the translation
+        `lakeshard translate` wrote to `.lake/lakeshard/lakefile.toml` (see `translated_config`)."""
         project_dir = os.path.abspath(project_dir)
-        toml_path = os.path.join(project_dir, "lakefile.toml")
+        toml_path = config or os.path.join(project_dir, "lakefile.toml")
         if not os.path.exists(toml_path):
-            if os.path.exists(os.path.join(project_dir, "lakefile.lean")):
-                raise ProjectError("only lakefile.toml is supported; run `lake translate-config toml` first")
-            raise ProjectError(f"no lakefile.toml in {project_dir}")
+            lean_cfg = os.path.join(project_dir, "lakefile.lean")
+            if os.path.exists(lean_cfg):
+                tr = translated_config(project_dir)
+                if not os.path.exists(tr) or os.path.getmtime(tr) < os.path.getmtime(lean_cfg):
+                    raise ProjectError(f"{project_dir} is configured with lakefile.lean: run `lakeshard translate "
+                                       f"{project_dir}` first (it runs Lake on lakefile.lean)")
+                toml_path = tr
+            else:
+                raise ProjectError(f"no lakefile.toml in {project_dir}")
         with open(toml_path, "rb") as fh:
             cfg = tomllib.load(fh)
         name = cfg.get("name")
@@ -216,9 +224,7 @@ class LakeProject:
                                 str(lib.get("buildType", "")),
                                 [f"lean_lib {lib['name']}: {k}" for k in DIRECT_UNSUPPORTED_KEYS if k in lib]))
         dt = cfg.get("defaultTargets") or [l.name for l in libs]
-        unsupported = [k for k in DIRECT_UNSUPPORTED_KEYS if k in cfg]
-        if cfg.get("lean_exe") or cfg.get("extern_lib") or cfg.get("input_file") or cfg.get("input_dir"):
-            unsupported.append("targets other than lean_lib")
+        unsupported = [k for k in DIRECT_UNSUPPORTED_KEYS if k in cfg]  # other target kinds are ignored
         return LakeProject(project_dir, toml_path, name, cfg.get("srcDir", "."),
                            cfg.get("buildDir", os.path.join(".lake", "build")), libs, list(dt),
                            flatten_lean_options(cfg.get("leanOptions")),
@@ -283,15 +289,23 @@ class LakeProject:
             return sorted(out)
         return [glob] if self._find(glob) else []
 
-    def graph(self) -> ProjectGraph:
-        targets: list[str] = []
-        for lib in self.libs:
-            if lib.name not in self.default_targets:
-                continue
-            for g in lib.globs:
-                for m in self._glob(lib, g):
-                    if m not in targets:
-                        targets.append(m)
+    def graph(self, targets: list[str] | None = None) -> ProjectGraph:
+        """The import graph of the default targets' modules, or of the given modules (each with its
+        whole project import closure), e.g. one Mathlib module and everything it needs."""
+        if targets:
+            missing = [m for m in targets if self._find(m) is None]
+            if missing:
+                raise ProjectError(f"no source file for target modules {missing[:5]}")
+            targets = list(dict.fromkeys(targets))
+        else:
+            targets = []
+            for lib in self.libs:
+                if lib.name not in self.default_targets:
+                    continue
+                for g in lib.globs:
+                    for m in self._glob(lib, g):
+                        if m not in targets:
+                            targets.append(m)
         if not targets:
             raise ProjectError("no modules found for the default targets")
         mods: dict[str, ModuleInfo] = {}
@@ -345,6 +359,34 @@ class LakeProject:
                 continue
             out.append(ln)
         return f"buildDir = {quote_toml(os.path.abspath(build_dir))}\n" + "\n".join(out) + "\n"
+
+
+def translated_config(project_dir: str) -> str:
+    """Where `lakeshard translate` keeps the TOML translation of a project's `lakefile.lean`
+    (inside Lake's own `.lake` directory; the project's files are not touched)."""
+    return os.path.join(os.path.abspath(project_dir), ".lake", "lakeshard", "lakefile.toml")
+
+
+def translate(project_dir: str, toolchain_bin: str) -> str:
+    """`lake translate-config toml` of a `lakefile.lean` project (runs Lake, i.e. the configuration's
+    Lean code; Lake documents the translation as lossy for non-declarative configuration, so the
+    result is checked against real Lake builds: `check-setup`, and the restore's `--no-build`)."""
+    import subprocess
+    project_dir = os.path.abspath(project_dir)
+    out = translated_config(project_dir)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    tmp = out + ".new"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    env = dict(os.environ)
+    env["PATH"] = toolchain_bin + os.pathsep + env.get("PATH", "")
+    env.pop("LEAN_PATH", None)
+    r = subprocess.run([os.path.join(toolchain_bin, "lake"), "translate-config", "toml", tmp], cwd=project_dir,
+                       env=env, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(tmp):
+        raise ProjectError(f"lake translate-config failed: {(r.stdout + r.stderr)[-1000:]}")
+    os.replace(tmp, out)
+    return out
 
 
 def quote_toml(s: str) -> str:

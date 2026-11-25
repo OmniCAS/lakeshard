@@ -90,23 +90,52 @@ class LocalStore(ArtifactStore):
         os.replace(tmp, dest)
 
     def put_record(self, rec: ModuleRecord) -> None:
-        p = self._rec(rec.module)
+        p = self._rec(rec.ident)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         tmp = f"{p}.tmp{os.getpid()}.{threading.get_ident()}"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"module": rec.module, "worker": rec.worker, "shard": rec.shard,
+            json.dump({"module": rec.module, "key": rec.key, "worker": rec.worker, "shard": rec.shard,
                        "files": [{"path": f.path, "sha256": f.sha256, "size": f.size} for f in rec.files]},
                       fh)
         os.replace(tmp, p)
 
-    def get_records(self, modules: list[str]) -> dict[str, ModuleRecord]:
+    def get_records(self, idents: list[str]) -> dict[str, ModuleRecord]:
+        """Records by key (direct backend) or by module name (batch backend)."""
         out = {}
-        for m in modules:
+        for m in idents:
             p = self._rec(m)
             if os.path.exists(p):
                 with open(p, encoding="utf-8") as fh:
                     out[m] = ModuleRecord.from_dict(json.load(fh))
         return out
+
+    def drop_record(self, ident: str) -> bool:
+        """Forget a record whose objects turned out corrupt, and delete those of its objects that do
+        not match their sha256 (objects are never rewritten, so a bad one must go before a rebuild
+        can store it again). Good objects stay (other records may share them)."""
+        p = self._rec(ident)
+        if not os.path.exists(p):
+            return False
+        try:
+            with open(p, encoding="utf-8") as fh:
+                rec = ModuleRecord.from_dict(json.load(fh))
+            for f in rec.files:
+                o = self._obj(f.sha256)
+                if os.path.exists(o) and sha256_file(o) != f.sha256:
+                    os.remove(o)
+        finally:
+            os.remove(p)
+        return True
+
+    def check_record(self, rec: ModuleRecord) -> bool:
+        """Every object of the record is present with the recorded size (cheap; no hashing)."""
+        for f in rec.files:
+            try:
+                if os.path.getsize(self._obj(f.sha256)) != f.size:
+                    return False
+            except OSError:
+                return False
+        return True
 
     def size(self) -> tuple[int, int]:
         n = b = 0

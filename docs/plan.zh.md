@@ -60,7 +60,7 @@
 
 - **S1 最小闭环**（单机）：协调器 + 直接调 `lean` 的 worker，合成仓库，与 `lake build` 逐字节一致。（已完成，见 `stages.md`）
 - **S2 跨机器的形态**（单机模拟）：worker 经 HTTP 向协调器领任务；每个 worker 用自己的本地构建目录；产物库两种实现（共享目录、HTTP）；用互不共享目录的多个进程验证。（已完成，见 `stages.md`；逐次运行记录的格式见 `run-records.md`）
-- **S3 仓库进、缓存出**：`lakeshard run <仓库>` 一条命令走完第 2 节；`lakeshard restore`；第 3 节第 1–6 项逐项有测试（杀掉重跑、注入失败、指纹不符、损坏的产物）；支持 Mathlib 这样用 `lakefile.lean` 和 module 系统的仓库；解决原版 Lake 对缓存的认可（直接调 `lean` 不产生 Lake 的 trace）。
+- **S3 仓库进、缓存出**（已完成，见 `stages.md`：`run`/`restore`、输入键与续建、封口、指纹、第 3 节各项的测试、`lakefile.lean`、`--target`；Mathlib 子闭包 96 个模块的 trace 输入哈希与原版一致）：`lakeshard run <仓库>` 一条命令走完第 2 节；`lakeshard restore`；第 3 节第 1–6 项逐项有测试（杀掉重跑、注入失败、指纹不符、损坏的产物）；支持 Mathlib 这样用 `lakefile.lean` 和 module 系统的仓库；解决原版 Lake 对缓存的认可（直接调 `lean` 不产生 Lake 的 trace）。
 - **S4 多机实验**：在三台机器上各起 worker（`worker-1`…`worker-3`），做第 5 节的三档验收。
 - **S5 规模余量**：假 worker 压力测试（大仓库的导入图、上千槽位）；模拟器按实测校准后外推。
 
@@ -74,6 +74,11 @@
 | 11-24 | 环境从简：多机实验经 SSH 直接在机器上跑，机器之间走内网直连，不依赖共享盘与沙箱；协调器与产物库放在 worker 能连到的机器上，worker 只向外连 | 能跑起来最重要；重点放在调度与切分的正确认知；有的机器不接受入站的高位端口 |
 | 11-24 | 产物库默认由协调器经 HTTP 提供（`/v1/store`），也可单独起 `lakeshard store serve` 或用目录 | 一个进程、一个端口；worker 只需连一个地址 |
 | 11-24 | 每次运行保存逐次尝试的运行记录（`modules.jsonl`，见 `run-records.md`），时间统一换算到协调器的时钟 | 给调度研究与模拟器校准用 |
+| 11-25 | 产物库里的记录按“输入键”存放（sha256：环境指纹、模块名、源文件哈希、库选项与参数、各导入模块的键）；构建前先查键，只建缺的 | 续建、增量、去重是同一条路径（第 3 节第 1 条）；键随源码或任一上游变化而变 |
+| 11-25 | 环境指纹包括 toolchain 与 `lean --githash`、平台、源码绝对路径、Lake 配置、manifest、各依赖构建的摘要（依赖每个模块 `.trace` 里的 depHash 与产物哈希）；worker 先取配置、自算指纹再注册，不符即拒 | 依赖构建的摘要读小文件即可，不必哈希几 GB 的 `.olean`；拒绝发生在派活之前 |
+| 11-25 | 让原版 Lake 认可直接后端的产物：“封口”时跑原版 `lake build`，用 `LAKE_OVERRIDE_LEAN` 与 `LEAN_SYSROOT` 指向一个符号链接拼成的 toolchain 目录，其中 `bin/lean` 是从产物库拷产物的垫片；trace 由 Lake 自己算、自己写 | 不重写 Lake 的哈希（随版本变）；实测 trace 的输入哈希与普通 `lake build` 一致（4.33.1、4.35.0，含 module 文件）；`lake build --old` 只认修改时间、不写 trace，不可用 |
+| 11-25 | 失败分类：同一模块在两个不同 worker 上编译出错即判为源码问题，不再重试；worker 失联、超时、导入产物损坏不计入 | 换机器仍失败就不是环境问题；损坏的产物由协调器删掉记录与坏对象、重建该模块 |
+| 11-25 | `lakefile.lean` 用 `lake translate-config toml` 译成 TOML 放进 `.lake/lakeshard/`，只在被检查过的范围内信任：`check-setup` 对照真实 Lake 构建，`restore` 后用原 `lakefile.lean` 跑 `--no-build` | Lake 自称翻译有损；实测 Mathlib 子闭包 96 个模块 setup 与 trace 输入哈希全同 |
 | 11-24 | 验收三档只用可信代码（合成、Mathlib 子闭包、Mathlib 全量） | 不依赖沙箱就能拿到效率数字；第三方仓库留给沙箱 |
 | 11-24 | 沙箱的构建档位就绪之前，多机实验经 SSH 直接在机器上跑：只跑可信代码；每台限核、低优先级；只用专用目录；不用管理员权限、不改系统配置；跑完清理 | 最快拿到多机的工程验证与效率数字；对其他用户的影响不超过沙箱本来被允许的量 |
 | 11-24 | 目标函数：以墙钟时间为主，同时记录 CPU·时 | 关心“更快”；成本留作对照 |

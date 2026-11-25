@@ -33,6 +33,9 @@ lakeshard build PROJECT --work WORK --workers 4 --threads 3          # Lake batc
 lakeshard build PROJECT --work WORK --backend lean --workers 4 --slots 3 --threads 3   # direct backend
 lakeshard worker serve --coordinator URL --id NAME --slots 3 --threads 3 --workspace DIR --token-file F
 lakeshard store serve --root DIR --listen HOST:PORT --token-file F   # a store server of its own
+lakeshard run REPO --work WORK [--rev R --checkout DIR] [--cache OUT] [--deps-command CMD]   # repository in, cache out
+lakeshard restore CACHE --checkout DIR          # put a cache into a checkout; stock lake build is then up to date
+lakeshard seal PROJECT --store DIR --manifest M --build-dir OUT --work W   # stock Lake writes the traces
 lakeshard check-setup PROJECT --lake-build-dir REF   # direct backend's lean calls vs a real lake build
 lakeshard assemble PROJECT --store WORK/store --dest OUT
 lakeshard verify PROJECT --build-dir OUT --reference REF --leanchecker-jobs 8 [--prefix-modules skip]
@@ -144,6 +147,62 @@ does not yet accept these outputs as up to date (milestone M3).
   end, report and release times on the coordinator's clock; fetch, compile and upload durations;
   CPU; peak memory; host; threads), format in `docs/run-records.md`.
 
+### Repository in, cache out (`lakeshard run`, `lakeshard restore`)
+
+`run` goes through: source (a directory used in place, or a Git URL or path cloned into
+`--checkout` at `--rev`), an optional dependency step (`--deps-command`, e.g. `lake exe cache get`),
+the environment fingerprint and module keys, the direct build (reusing everything already in the
+store), the seal, an optional kernel check (`--leanchecker-jobs N`), and packing. It writes
+`WORK/run.json` with the time of every phase.
+
+- **Keys and reuse** (`fingerprint.py`). The fingerprint covers the toolchain (`lean-toolchain`,
+  `lean --githash`), platform, project path, Lake configuration, `lake-manifest.json` and a digest
+  of each dependency's build (the `depHash`/output hashes in its `.trace` files). A module's key is
+  sha256 over the fingerprint, its name, the sha256 of its source, its library options and
+  arguments, and the keys of its project imports. The store files records under keys; a build
+  first looks up every key and builds only the missing modules, so a rerun after a crash resumes,
+  an edited file rebuilds exactly its downstream modules, and identical inputs are never built
+  twice.
+- **Seal** (`seal.py`, `sealshim.py`). The direct backend writes no Lake traces, and Lake rebuilds
+  a module without a matching trace (`lake build --old` accepts outputs by modification time but
+  writes no traces). So the seal runs stock `lake build` with `LAKE_OVERRIDE_LEAN=true` and
+  `LEAN_SYSROOT` pointing to a copy of the toolchain directory made of symbolic links whose
+  `bin/lean` is a shim: for each module Lake asks to compile, the shim copies the stored outputs
+  (sha256 checked) into place; modules missing from the store go to the real `lean`. Lake computes
+  and writes its own `.trace` and `.hash` files; their input hashes equal those of a plain
+  `lake build` (checked on Lean 4.33.1 and 4.35.0, `module` files included), and
+  `lake build --no-build` must then pass. Sealing runs Lake on the project configuration: run it
+  where the project is trusted.
+- **Cache** (`cache.py`): `manifest.json` (source, package, toolchain, fingerprint, module keys,
+  every file with its sha256) and `objects/` named by sha256: all outputs of the sealed build
+  directory, Lake's traces and hash files included (the command lines Lake logs in traces, which
+  carry the build machine's paths, are removed).
+- **Restore** refuses a checkout whose toolchain, platform, manifest or dependency builds differ
+  (`--force` to override), checks the sha256 of every file, copies the files into the checkout's
+  build directory and runs `lake build --no-build`. Lake's input hashes do not depend on paths, so
+  a checkout at another path is accepted (its `.olean` files then name the original path in
+  linter messages).
+- **Robustness** (each with a test in `tests/test_robustness.py` or `tests/test_direct_end_to_end.py`):
+  killing the whole build and rerunning resumes from the store; a module that fails on two
+  different workers is classified as a source error and only its importers are skipped; a
+  worker whose fingerprint differs is refused (`/v1/config` first, then `/v1/register` with the
+  worker's own fingerprint); an object that fails its sha256 when a worker fetches it makes the
+  coordinator drop that record and object and rebuild the module before its importers; lost
+  workers and late results are handled as before; every attempt is recorded.
+
+- **`lakefile.lean` projects** (Mathlib itself): `lakeshard translate PROJECT` (done by `run`
+  automatically) runs `lake translate-config toml` into `PROJECT/.lake/lakeshard/lakefile.toml`
+  (inside Lake's own `.lake`; the project's files are untouched) and every command then reads
+  that; workers receive the text with their configuration. Lake calls its translation lossy for
+  non-declarative configuration, so it is only trusted as far as it is checked: `check-setup`
+  against a real Lake build, and `restore`, whose `lake build --no-build` runs with the original
+  `lakefile.lean`. Targets other than libraries (executables, scripts) are ignored.
+- **A part of a project**: `--target MODULE` (repeatable) on `run`, `build`, `reference`,
+  `verify`, `assemble`, `check-setup` builds those modules and their project imports only, e.g. a
+  Mathlib sub-closure; the seal then runs `lake build MODULE ...`.
+
+Not yet: the seal's traces carry no warnings for later `lake build`s to replay.
+
 ### Remote workers (direct backend)
 
 Machines are called by role here: `hub` runs the coordinator, `worker-1`, `worker-2`, ... run
@@ -228,6 +287,7 @@ A remote executor or an HTTP service would send the same job JSON.
 | c | a mid-sized private project that depends on Mathlib (230 modules) | 4 x 2: 597 s (`lake build` 8 threads 503 s; critical path 444 s, so at most 4.65x on any number of machines); 690 files identical; `--no-build --rehash` and `leanchecker` pass |
 | S1 | direct `lean` backend, pull workers over HTTP, shared build directory (one machine) | `lean` calls identical to Lake's (setup, command line, `LEAN_PATH`) for 40 + 316 + 6 + 230 modules; outputs identical to `lake build` (120, 948, 34 files); 316 modules 18.3 s vs `lake build` 17.8 s, 1.05 of the lower bound |
 | S2 | per-worker build directories, artifact store over HTTP (directory or HTTP implementation), run records | 40 and 316 modules identical to `lake build` (120, 948 files); 316 modules 17.7 s vs `lake build` 17.8 s; 121 MB fetched over HTTP in 2.1 s in total |
+| S3 | repository in, cache out: `run`, `restore`, input keys and resume, seal (stock Lake writes the traces), fingerprint checks, `lakefile.lean`, `--target` | traces equal to plain `lake build` (40-module project, `module` project, Mathlib sub-closure 96 / 96); Mathlib-based project: build 456 s on 8 slots, 690 files identical, `--no-build --rehash` passes; robustness items each tested |
 | d | separate machines | not started (S4) |
 
 ## Design notes
@@ -237,7 +297,7 @@ A remote executor or an HTTP service would send the same job JSON.
   infrastructure and model orchestration.
 - `docs/research/`: the research notes behind it (Omega Institute's sharded build, Isabelle's cluster
   build, Mathlib/Lake caching, analysis tools).
-- `docs/stages.md`: measurements of stages a-c, S1 and S2.
+- `docs/stages.md`: measurements of stages a-c and S1-S3.
 - `docs/run-records.md`: the per-attempt run records (`modules.jsonl`) for schedule analysis and simulator calibration.
 - `docs/plan.zh.md` (Chinese): goal (repository in, build cache out), pipeline, robustness rules, acceptance tiers, steps S1-S5 and the decision record.
 

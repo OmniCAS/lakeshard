@@ -51,7 +51,7 @@ def test_direct_equals_lake_build(tmp_path, proj_and_ref, storage):
         assert not os.listdir(os.path.join(out_dir, ".lakeshard-tmp"))  # temporary files cleaned up
     else:
         store = rep["store_root"] or rep["store"]
-        asm = api.assemble(str(proj), store, str(tmp_path / "assembled"))
+        asm = api.assemble(str(proj), store, str(tmp_path / "assembled"), manifest=rep["manifest"])
         assert asm["ok"], asm
         out_dir = tmp_path / "assembled"
     ver = api.verify(str(proj), str(out_dir), reference=str(ref), leanchecker_jobs=4, lake_check=False)
@@ -87,7 +87,7 @@ def test_lost_worker_and_remote_style_worker(tmp_path, proj_and_ref):
     work = tmp_path / "work"
     out = {}
     t = threading.Thread(target=lambda: out.update(api.build_direct(
-        str(proj), str(work), local_workers=0, lease_s=3.0, heartbeat_s=0.5, wait_timeout_s=300)))
+        str(proj), str(work), local_workers=0, lease_s=3.0, heartbeat_s=0.5, wait_timeout_s=300)), daemon=True)
     t.start()
     cj = work / "coordinator.json"
     for _ in range(200):
@@ -96,7 +96,10 @@ def test_lost_worker_and_remote_style_worker(tmp_path, proj_and_ref):
         time.sleep(0.05)
     info = json.loads(cj.read_text())
     token = open(info["token_file"]).read().strip()
-    _post(info["url"], token, "/v1/register", {"worker": "ghost", "slots": 2})
+    from lakeshard.fingerprint import fingerprint
+    from lakeshard.project import LakeProject
+    fp = fingerprint(LakeProject.load(str(proj)), info["toolchain_bin"])  # the ghost's environment is right
+    _post(info["url"], token, "/v1/register", {"worker": "ghost", "slots": 2, "fingerprint": fp})
     lost = _post(info["url"], token, "/v1/claim", {"worker": "ghost", "n": 2, "wait_s": 5})["tasks"]
     assert lost
     src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
@@ -110,7 +113,7 @@ def test_lost_worker_and_remote_style_worker(tmp_path, proj_and_ref):
     assert {f["module"] for f in out["failures"]} == {x["module"] for x in lost}
     assert all(f.get("reason") == "worker lost" for f in out["failures"])
     assert out["store"].startswith("http://")  # the separately started worker used the HTTP store with the token
-    asm = api.assemble(str(proj), out["store_root"], str(tmp_path / "assembled"))
+    asm = api.assemble(str(proj), out["store_root"], str(tmp_path / "assembled"), manifest=out["manifest"])
     assert asm["ok"], asm
     ver = api.verify(str(proj), str(tmp_path / "assembled"), reference=str(ref), lake_check=False)
     assert ver["compare"]["ok"] and ver["compare"]["identical_files"] == 120, ver["compare"]

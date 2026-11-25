@@ -209,11 +209,81 @@ per task); dispatch latency (coordinator hands out, worker starts) median 0.4 ms
 visible; across machines the fetches grow with the import closure (each worker ends up holding
 most outputs), which is what S4 measures.
 
+## Stage S3: repository in, build cache out (one machine)
+
+`lakeshard run` = source, environment fingerprint and module keys, direct build reusing the store,
+seal, optional kernel check, pack; `lakeshard restore` puts the cache into a checkout.
+
+How stock Lake is made to accept the direct backend's outputs (measured, not assumed):
+
+- without traces, `lake build` rebuilds; `lake build --old` accepts the outputs by modification
+  time (no rebuild) but writes only `.hash` files and no traces, so the next plain `lake build`
+  rebuilds again;
+- Lake takes its `lean` from the toolchain directory next to its own executable unless
+  `LAKE_OVERRIDE_LEAN=true`, then from `LEAN_SYSROOT`;
+- sealing with a stand-in toolchain whose `bin/lean` copies stored outputs: on the 40-module
+  project all 40 came from the store in 0.6 s; Lake's traces have the same input hash (`depHash`)
+  as those of a plain `lake build` for 40 / 40 modules, the `.olean` and `.hash` files are
+  identical, `lake build --no-build` reports "All targets up-to-date"; on Lean 4.35.0 the
+  `module`-system test project gives the same `depHash` as Lake and passes `--no-build --rehash`.
+
+The 40-module project through `run` (3 workers x 2 slots):
+build 3.1 s, seal 1.0 s (40 from the store, none compiled), `leanchecker` 40 / 40 in 6.1 s, pack
+0.1 s (280 files, 3.7 MB). Restored into a copy of the sources at another path: 280 files in
+0.09 s, `lake build --no-build` up to date, a following plain `lake build` compiles nothing.
+A second `build` of the same project: 0 built, 40 from the store, 0.13 s.
+
+The Mathlib-based project of stage c (230 modules, Lean 4.35.0, Mathlib from its cache) through
+`run`, 4 workers x 2 slots x 2 threads (8 slots), per-worker build directories, HTTP store:
+
+| | direct backend, this run | stage c: `lake build`, 8 threads | stage c: Lake batches, 4 x 2 |
+|---|---:|---:|---:|
+| build wall | 455.9 s | 503.2 s | 596.7 s |
+| CPU (user + sys, whole run) | 2,142 s | 2,219 s | 2,160 s |
+| largest RSS of one process | 4.2 GB | 3.6 GB | 3.8 GB |
+| critical path (own measured times) | 401.7 s | 444 s | - |
+| wall / bound | 1.13 | 1.13 | - |
+
+(The stage c runs were two days earlier on the same machine, so the comparison is indicative.)
+The 317-second file took 281 s on 2 threads here. Seal: 230 modules from the store, 5.2 s, no
+compilation; `lake build --no-build` then reports "All targets up-to-date (3412 jobs)" (Mathlib
+included). The sealed directory is identical to the stage c reference build (690 `.olean`/`.ilean`/`.c`
+files) and passes `lake build --no-build --rehash`. Cache: 1,610 files, 417 MB, packed in 0.9 s;
+whole `run` 463 s.
+
+A Mathlib sub-closure through the `lakefile.lean` path: a Mathlib v4.35.0 checkout as the root
+project (its dependencies from the official cache), `run --target Mathlib.Order.Basic` (96 Mathlib
+modules, 24k lines, all `module` files with `public`/`meta`/`all` imports and Mathlib's
+`weak.linter.*` options). Reference: plain `lake build Mathlib.Order.Basic` in the checkout with
+Mathlib's own `lakefile.lean`, 17.6 s.
+
+- `check-setup` against that build: 96 / 96 setup files, command lines and `LEAN_PATH` identical;
+- `run`, 4 workers x 3 slots x 1 thread: translate 0.3 s, build 17.2 s (1.07 of its lower bound,
+  critical path 15.6 s), seal 2.2 s (96 from the store, none compiled), pack 0.7 s; whole run 21.5 s;
+- outputs identical to the reference: 672 / 672 files (`.olean`, `.olean.server`, `.olean.private`,
+  `.ilean`, `.ir`, `.ir.sig`, `.c`); Lake's input hash in the sealed traces equals that of the
+  reference build for 96 / 96 modules, so the translated configuration gives Lake the same inputs
+  as the original `lakefile.lean`.
+
+Robustness, each item of `plan.zh.md` section 3 with a test (`tests/test_robustness.py`,
+`tests/test_direct_end_to_end.py`, `tests/test_scheduler.py`, `tests/test_httpstore.py`):
+
+| item | test | result |
+|---|---|---|
+| 1 the store decides what is built | kill the whole build (coordinator and workers, SIGKILL) after 12 of 40 modules; rerun | rerun builds only the rest; outputs identical to `lake build` |
+| 1 incremental | edit one module after a full `run`; `run` again | rebuilt exactly the edited module and its importers; the seal found the others up to date |
+| 2 idempotent | rebuilt and duplicated modules (lost worker, retries, rerun) | same bytes; outputs renamed into place, `.olean` last |
+| 3 failure isolation and classes | a module with a type error, 3 workers | fails on two different workers, classified `source`; only its importers skipped; all others built |
+| 4 environment mismatch | a worker with another fingerprint | refused at registration (exit 3), listed in the report; another worker finishes the build |
+| 5 corruption | an object of the store damaged (same size) under a module that a rebuild needs | the fetching worker notices the sha256 mismatch; the coordinator drops the record and the bad object, rebuilds that module, then its importer; result identical to `lake build` |
+| 5 corrupt cache | a cache object damaged before `restore` | `restore` refuses |
+| 4 restore elsewhere | `restore` with another environment fingerprint | refused (`--force` to override) |
+| 6 records | every run | `events.jsonl`, `modules.jsonl`, `report.json`, `manifest.json`, `run.json` |
+
 ## Known limits and next steps
 
-Direct backend next: S3 `run` (repository in, cache out) and `restore`, Lake traces for the direct
-backend, Mathlib-style `lakefile.lean` projects; S4 three machines; S5 scale tests with fake
-workers. The items below are about the Lake batch backend.
+Direct backend next: S4 three machines and the three acceptance tiers (synthetic, a Mathlib
+sub-closure, all of Mathlib); S5 scale tests with fake workers. The items below are about the Lake batch backend.
 
 - Batches report only when complete; streaming each module's outputs as soon as Lake reports
   it built would remove most of the waiting seen in stage c.

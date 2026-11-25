@@ -29,7 +29,7 @@ import time
 from .lakeenv import LakeWorkspace
 from .project import LakeProject, module_rel
 from .protocol import BuildConfig, FileRef, ModuleRecord, ModuleResult, ModuleTask
-from .store import open_store, sha256_file
+from .store import IntegrityError, open_store, sha256_file
 from .worker import run_tracked
 
 LAKE_META_SUFFIXES = (".trace", ".olean.hash", ".olean.server.hash", ".olean.private.hash", ".ilean.hash",
@@ -74,7 +74,7 @@ class ModuleBuilder:
         self.cfg, self.worker_id, self.default_threads = cfg, worker_id, default_threads
         self.host = socket.gethostname()
         self.workspace = os.path.abspath(workspace)
-        proj = LakeProject.load(cfg.project_dir)
+        proj = load_worker_project(cfg, self.workspace)
         if cfg.storage == "shared":
             if not cfg.build_dir:
                 raise ValueError("storage=shared needs a build directory")
@@ -87,7 +87,7 @@ class ModuleBuilder:
         self.ws = LakeWorkspace(proj, self.build_dir, cfg.toolchain_bin)
         self.ws.check_supported()
         self.store = open_store(cfg.store, token=token) if cfg.storage == "store" else None
-        self.present: dict[str, str] = {}  # storage=store: module -> digest of the record present here
+        self.present: dict[str, str] = {}  # storage=store: key (or name) -> module, for outputs present here
         self.lock = threading.Lock()
         self.procs: dict[str, object] = {}
         self.cancelled: set[str] = set()
@@ -169,7 +169,7 @@ class ModuleBuilder:
             if self.cfg.keep_setup:
                 outs[".setup.json"] = setup_path
                 final[".setup.json"] = os.path.join(self.build_dir, "ir", module_rel(m) + ".setup.json")
-            self._publish(m, outs, final, res)
+            self._publish(m, outs, final, res, task.key)
             res.ok = True
         except Exception as e:  # noqa: BLE001 - reported to the coordinator
             res.error = f"{type(e).__name__}: {e}"
@@ -208,15 +208,20 @@ class ModuleBuilder:
             with self.lock:
                 if u in self.present:
                     continue
-            for f in r.files:
-                self.store.get_file(f, os.path.join(self.build_dir, f.path))
-                res.fetched_bytes += f.size
-                res.fetched_files += 1
+            try:
+                for f in r.files:
+                    self.store.get_file(f, os.path.join(self.build_dir, f.path))
+                    res.fetched_bytes += f.size
+                    res.fetched_files += 1
+            except IntegrityError:
+                res.corrupt.append(u)  # the coordinator drops this record and rebuilds that module
+                raise
             with self.lock:
-                self.present[u] = r.digest()
+                self.present[u] = r.module
         res.fetch_s = time.time() - t
 
-    def _publish(self, m: str, outs: dict[str, str], final: dict[str, str], res: ModuleResult) -> None:
+    def _publish(self, m: str, outs: dict[str, str], final: dict[str, str], res: ModuleResult,
+                 key: str = "") -> None:
         t = time.time()
         rel_base = module_rel(m)
         for d in ("lib/lean", "ir"):
@@ -245,11 +250,22 @@ class ModuleBuilder:
                 stored = self.store.put_file(os.path.join(self.build_dir, ref.path))
                 stored.path = ref.path
                 files.append(stored)
-            rec = ModuleRecord(m, files, self.worker_id, res.task_id)
+            rec = ModuleRecord(m, files, self.worker_id, res.task_id, key=key)
             self.store.put_record(rec)
             with self.lock:
-                self.present[m] = rec.digest()
+                self.present[rec.ident] = m
         res.publish_s = time.time() - t
+
+
+def load_worker_project(cfg: BuildConfig, workspace: str) -> LakeProject:
+    """The project as the coordinator sees it (with its translation of a `lakefile.lean`)."""
+    if cfg.lakefile_toml:
+        os.makedirs(workspace, exist_ok=True)
+        path = os.path.join(os.path.abspath(workspace), "lakefile.translated.toml")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(cfg.lakefile_toml)
+        return LakeProject.load(cfg.project_dir, config=path)
+    return LakeProject.load(cfg.project_dir)
 
 
 def _first_error(out: str) -> str:

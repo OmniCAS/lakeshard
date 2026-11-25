@@ -8,10 +8,14 @@ from .project import ProjectGraph
 from .store import open_store
 
 
-def assemble(graph: ProjectGraph, store_location: str, dest_build_dir: str) -> dict:
+def assemble(graph: ProjectGraph, store_location: str, dest_build_dir: str, idents: dict | None = None,
+             token: str | None = None) -> dict:
+    """`idents`: module -> record key (from a build manifest); default: records filed by module name."""
     t0 = time.time()
-    store = open_store(store_location)
-    recs = store.get_records(list(graph.modules))
+    store = open_store(store_location, token=token)
+    ids = {m: (idents or {}).get(m, m) for m in graph.modules}
+    by_id = store.get_records(sorted(set(ids.values())))
+    recs = {m: by_id[i] for m, i in ids.items() if i in by_id}
     missing = sorted(set(graph.modules) - set(recs))
     files = nbytes = 0
     for m in graph.order:

@@ -19,11 +19,12 @@ def _config_for(project: LakeProject, build_dir: str) -> str:
     return cfg
 
 
-def lake_no_build(project: LakeProject, build_dir: str, toolchain_bin: str, rehash: bool = True) -> dict:
-    """`lake build --no-build [--rehash]` of the default targets against `build_dir`."""
+def lake_no_build(project: LakeProject, build_dir: str, toolchain_bin: str, rehash: bool = True,
+                  targets: list[str] | None = None) -> dict:
+    """`lake build --no-build [--rehash] [targets]` (default targets) against `build_dir`."""
     cfg = _config_for(project, build_dir)
     cmd = [os.path.join(toolchain_bin, "lake"), "-d", project.project_dir, "-f", cfg, "--no-ansi", "build",
-           "--no-build"] + (["--rehash"] if rehash else [])
+           "--no-build"] + (["--rehash"] if rehash else []) + list(targets or [])
     code, out, wall, cpu, rss, _ = run_tracked(cmd, lake_env(toolchain_bin), 3600)
     return {"ok": code == 0, "exit": code, "seconds": round(wall, 2), "rehash": rehash,
             "output_tail": out.strip().splitlines()[-1] if out.strip() else ""}

@@ -63,6 +63,9 @@ class StoreEndpoints:
             rec = ModuleRecord.from_dict(json.loads(_read_body(h)))
             self.store.put_record(rec)
             return _send_json(h, 200, {"ok": True})
+        if sub == "/records/drop" and method == "POST":
+            idents = json.loads(_read_body(h)).get("idents", [])
+            return _send_json(h, 200, {"dropped": [i for i in idents if self.store.drop_record(i)]})
         if sub == "/records/query" and method == "POST":
             mods = json.loads(_read_body(h)).get("modules", [])
             recs = self.store.get_records(mods)
@@ -280,6 +283,12 @@ class HttpStore(ArtifactStore):
                                     headers={"Content-Type": "application/json", "Content-Length": str(len(data))})
         if status != 200:
             raise IntegrityError(f"store refused the record of {rec.module}: {status} {out[:200]!r}")
+
+    def drop_record(self, ident: str) -> bool:
+        data = json.dumps({"idents": [ident]}).encode()
+        status, body = self._request("POST", "/records/drop", body=data,
+                                     headers={"Content-Type": "application/json", "Content-Length": str(len(data))})
+        return status == 200 and ident in json.loads(body).get("dropped", [])
 
     def get_records(self, modules: list[str]) -> dict[str, ModuleRecord]:
         out: dict[str, ModuleRecord] = {}

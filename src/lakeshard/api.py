@@ -104,7 +104,8 @@ def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int =
                  visibility_timeout_s: float = 0.0, heavy_cost: float | None = None, heavy_threads: int = 0,
                  lease_s: float = 60.0, heartbeat_s: float = 5.0, keep_setup: bool = False,
                  wait_timeout_s: float | None = None, python: str = sys.executable,
-                 advertise_host: str | None = None) -> dict:
+                 advertise_host: str | None = None, reuse: bool = True, check_fingerprint: bool = True,
+                 targets: list[str] | None = None) -> dict:
     """Build every module with one `lean` process per module; workers pull tasks over HTTP.
 
     The coordinator runs in this process. `local_workers` (default `workers`) worker processes
@@ -115,14 +116,19 @@ def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int =
     a directory every worker can read and write when `store` is a path, or another store server
     when `store` is an `http://` URL.
     storage="shared": all workers write into `build_dir` (default `<work>/build`).
+    With a store, every module's record is filed under its input key (`fingerprint.py`); modules
+    whose key is already in the store are not built again (`reuse=False` rebuilds everything).
+    Workers whose environment fingerprint differs from the coordinator's are refused.
     """
+    from .fingerprint import fingerprint as env_fingerprint, module_keys
+    from .store import LocalStore, open_store
     from .lakeenv import LakeWorkspace
     from .protocol import BuildConfig
     from .scheduler import ModuleScheduler
     from .service import BuildService
 
     proj = LakeProject.load(project_dir)
-    g = proj.graph()
+    g = proj.graph(targets)
     tb = toolchain_bin(proj.project_dir, toolchain)
     work_dir = os.path.abspath(work_dir)
     os.makedirs(work_dir, exist_ok=True)
@@ -132,19 +138,18 @@ def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int =
         store_root = os.path.join(work_dir, "store")  # served by the coordinator
     elif store and not store.startswith(("http://", "https://")):
         store = os.path.abspath(store)
-    LakeWorkspace(proj, build_dir, tb).check_supported()  # refuse early
+    lws = LakeWorkspace(proj, build_dir, tb)
+    lws.check_supported(g)  # refuse early
+    lws.check_imports(g)
     for m in g.modules:
         if proj.lib_of(m) is None:
             raise ValueError(f"{m} is imported but is not a buildable module of any lean_lib")
     hist_out = os.path.join(work_dir, "history.json")
     hist_in = load_history(history) if history else load_history(hist_out)
     costs = estimate_costs(g, hist_in)
-    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
-    cfg = BuildConfig(run_id, proj.project_dir, tb, storage, build_dir if storage == "shared" else "",
-                      (store or "") if storage == "store" else "", visibility_timeout_s, 0.5, heartbeat_s, keep_setup)
-    sched = ModuleScheduler(g, costs, retries=retries, lease_s=lease_s, timeout_s=timeout_s,
-                            heavy_cost=heavy_cost if heavy_cost is not None else float("inf"),
-                            heavy_threads=heavy_threads, needs_closure=storage == "store", fail_once=fail_once)
+    t_prep = time.time()
+    fp = env_fingerprint(proj, tb)
+    keys = module_keys(g, proj, fp["sha256"])
     if token_file and os.path.exists(token_file):
         token = open(token_file, encoding="utf-8").read().strip()
     else:
@@ -153,9 +158,31 @@ def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int =
         fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as fh:
             fh.write(token + "\n")
+    cached: set[str] = set()
+    if storage == "store" and reuse:
+        st = LocalStore(store_root) if store_root else open_store(store, token=token)
+        recs = st.get_records(list(keys.values()))
+        for m, k in keys.items():
+            r = recs.get(k)
+            if r is not None and any(f.path.endswith(".olean") for f in r.files) and \
+                    (not isinstance(st, LocalStore) or st.check_record(r)):
+                cached.add(m)
+    prep_s = time.time() - t_prep
+    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
+    cfg = BuildConfig(run_id, proj.project_dir, tb, storage, build_dir if storage == "shared" else "",
+                      (store or "") if storage == "store" else "", visibility_timeout_s, 0.5, heartbeat_s, keep_setup,
+                      fingerprint=fp["sha256"] if check_fingerprint else "",
+                      lakefile_toml=open(proj.lakefile, encoding="utf-8").read()
+                      if os.path.basename(proj.lakefile) != "lakefile.toml" or
+                      os.path.dirname(proj.lakefile) != proj.project_dir else "")
+    sched = ModuleScheduler(g, costs, retries=retries, lease_s=lease_s, timeout_s=timeout_s,
+                            heavy_cost=heavy_cost if heavy_cost is not None else float("inf"),
+                            heavy_threads=heavy_threads, needs_closure=storage == "store", fail_once=fail_once,
+                            keys=keys if storage == "store" else None, done=cached)
     host, _, port = listen.rpartition(":")
     svc = BuildService(g, sched, cfg, work_dir, token=token, host=host or "127.0.0.1", port=int(port or 0),
-                       store_root=store_root, advertise_host=advertise_host)
+                       store_root=store_root, advertise_host=advertise_host,
+                       fingerprint=fp if check_fingerprint else None, keys=keys)
     if store_root:
         cfg.store = svc.url  # workers reach the store through the coordinator
     svc.start()
@@ -195,6 +222,10 @@ def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int =
         report = svc.report_dict()
         report["run_records"] = os.path.join(work_dir, "modules.jsonl")
         report["run_record_count"] = svc.write_records(report["run_records"])
+        report["manifest"] = os.path.join(work_dir, "manifest.json")
+        svc.write_manifest(report["manifest"])
+        report["fingerprint"] = fp["sha256"]
+        report["prepare_s"] = round(prep_s, 2)
         svc.stop()
     report.update({"finished": finished, "url": svc.url, "local_workers": n_local, "slots_per_worker": slots,
                    "threads_per_lean": threads, "retries": retries, "run_id": run_id,
@@ -225,12 +256,125 @@ def _wait_build(svc, sched, procs: list, timeout_s: float | None) -> bool:
                 return False
 
 
-def check_setup(project_dir: str, lake_build_dir: str, toolchain: str | None = None, limit: int = 20) -> dict:
+def _git(args: list[str], cwd: str | None = None) -> str:
+    out = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {out.stderr.strip()[:500]}")
+    return out.stdout.strip()
+
+
+def fetch_source(repo: str, rev: str | None = None, checkout: str | None = None) -> tuple[str, dict]:
+    """The project directory to build and a description of the source. A local directory without
+    `rev`/`checkout` is used in place; otherwise `repo` (URL or path) is cloned into `checkout`
+    (kept between runs) and `rev` checked out."""
+    if os.path.isdir(repo) and not rev and not checkout:
+        d = os.path.abspath(repo)
+        info = {"repo": d, "path": d}
+        if os.path.isdir(os.path.join(d, ".git")):
+            info["commit"] = _git(["rev-parse", "HEAD"], d)
+            info["dirty"] = bool(_git(["status", "--porcelain"], d))
+        return d, info
+    if not checkout:
+        raise ValueError("a repository URL needs --checkout (where to clone it; same path on every worker)")
+    checkout = os.path.abspath(checkout)
+    if not os.path.isdir(os.path.join(checkout, ".git")):
+        _git(["clone", "--quiet", repo, checkout])
+    elif rev:
+        _git(["fetch", "--quiet", "origin"], checkout)
+    if rev:
+        _git(["checkout", "--quiet", "--detach", rev], checkout)
+    return checkout, {"repo": repo, "rev": rev, "commit": _git(["rev-parse", "HEAD"], checkout), "path": checkout}
+
+
+def run(repo: str, work_dir: str, rev: str | None = None, checkout: str | None = None,
+        cache_dir: str | None = None, deps_command: str | None = None, leanchecker_jobs: int = 0,
+        toolchain: str | None = None, targets: list[str] | None = None, **build_kw) -> dict:
+    """Repository in, build cache out: source, (dependencies), build, seal, (kernel check), pack."""
+    from .cache import pack
+    from .seal import seal
+
+    work_dir = os.path.abspath(work_dir)
+    os.makedirs(work_dir, exist_ok=True)
+    phases: dict[str, float] = {}
+    t = time.time()
+    project_dir, source = fetch_source(repo, rev, checkout)
+    phases["source_s"] = round(time.time() - t, 2)
+    out: dict = {"source": source, "phases": phases}
+    if deps_command:
+        t = time.time()
+        r = subprocess.run(deps_command, shell=True, cwd=project_dir, capture_output=True, text=True)
+        phases["dependencies_s"] = round(time.time() - t, 2)
+        if r.returncode != 0:
+            return {**out, "ok": False, "phase": "dependencies", "error": (r.stdout + r.stderr)[-2000:]}
+    if not os.path.exists(os.path.join(project_dir, "lakefile.toml")) and \
+            os.path.exists(os.path.join(project_dir, "lakefile.lean")):
+        from .project import translate
+        t = time.time()
+        out["translated_config"] = translate(project_dir, toolchain_bin(project_dir, toolchain))
+        phases["translate_s"] = round(time.time() - t, 2)
+    proj = LakeProject.load(project_dir)
+    g = proj.graph(targets)
+    tb = toolchain_bin(proj.project_dir, toolchain)
+    t = time.time()
+    rep = build_direct(project_dir, os.path.join(work_dir, "build"), toolchain=toolchain, targets=targets, **build_kw)
+    phases["build_s"] = round(time.time() - t, 2)
+    out["build"] = {k: rep.get(k) for k in ("ok", "wall_s", "modules", "from_store", "built", "status", "slots",
+                                            "lower_bound", "failed_modules", "skipped_count", "refused_workers",
+                                            "failures", "run_records", "fingerprint")}
+    if not rep["ok"]:
+        return {**out, "ok": False, "phase": "build"}
+    store_dir = rep.get("store_root") or rep.get("store")
+    if not store_dir or "://" in store_dir:
+        return {**out, "ok": False, "phase": "seal", "error": "sealing needs the store as a directory"}
+    t = time.time()
+    sealed = os.path.join(work_dir, "sealed")
+    out["seal"] = seal(project_dir, store_dir, sealed, tb, work_dir, manifest=rep["manifest"], targets=targets)
+    phases["seal_s"] = round(time.time() - t, 2)
+    if not out["seal"]["ok"]:
+        return {**out, "ok": False, "phase": "seal"}
+    if leanchecker_jobs:
+        t = time.time()
+        v = verify(project_dir, sealed, lake_check=False, leanchecker_jobs=leanchecker_jobs, prefix_modules="skip",
+                   toolchain=toolchain, targets=targets)
+        out["kernel"] = {k: v["leanchecker"][k] for k in ("ok", "runs", "ok_runs", "prefix_modules", "seconds")}
+        phases["kernel_s"] = round(time.time() - t, 2)
+        if not v["leanchecker"]["ok"]:
+            return {**out, "ok": False, "phase": "kernel", "failed": v["leanchecker"]["failed"]}
+    with open(rep["manifest"], encoding="utf-8") as fh:
+        bman = json.load(fh)
+    t = time.time()
+    cache_dir = os.path.abspath(cache_dir or os.path.join(work_dir, "cache"))
+    out["cache"] = pack(proj, g, sealed, cache_dir, bman["fingerprint"], bman["modules"], source)
+    phases["pack_s"] = round(time.time() - t, 2)
+    out["ok"] = True
+    phases["total_s"] = round(sum(v for k, v in phases.items() if k != "total_s"), 2)
+    with open(os.path.join(work_dir, "run.json"), "w", encoding="utf-8") as fh:
+        json.dump(out, fh, indent=1)
+    return out
+
+
+def seal_build(project_dir: str, store: str, manifest: str | None, build_dir: str, work_dir: str,
+               toolchain: str | None = None) -> dict:
+    from .seal import seal
+    proj = LakeProject.load(project_dir)
+    os.makedirs(work_dir, exist_ok=True)
+    return seal(proj.project_dir, store, build_dir, toolchain_bin(proj.project_dir, toolchain), work_dir,
+                manifest=manifest)
+
+
+def restore(cache_dir: str, checkout: str, check: bool = True, force: bool = False,
+            toolchain: str | None = None) -> dict:
+    from .cache import restore as _restore
+    return _restore(cache_dir, checkout, toolchain_bin(os.path.abspath(checkout), toolchain), check, force)
+
+
+def check_setup(project_dir: str, lake_build_dir: str, toolchain: str | None = None, limit: int = 20,
+                targets: list[str] | None = None) -> dict:
     """Compare the setup files, command lines and LEAN_PATH of the direct backend with a real Lake build."""
     from .lakeenv import LakeWorkspace, compare_with_lake
 
     proj = LakeProject.load(project_dir)
-    g = proj.graph()
+    g = proj.graph(targets)
     ws = LakeWorkspace(proj, lake_build_dir, toolchain_bin(proj.project_dir, toolchain))
     out = compare_with_lake(ws, g.order, os.path.abspath(lake_build_dir), limit=limit)
     out["modules"] = len(g.modules)
@@ -238,19 +382,26 @@ def check_setup(project_dir: str, lake_build_dir: str, toolchain: str | None = N
     return out
 
 
-def assemble(project_dir: str, store: str, dest_build_dir: str) -> dict:
-    g = LakeProject.load(project_dir).graph()
-    return _assemble(g, store, dest_build_dir)
+def assemble(project_dir: str, store: str, dest_build_dir: str, manifest: str | None = None,
+             token: str | None = None, targets: list[str] | None = None) -> dict:
+    """Copy every module's outputs from the store into one build directory. With the `manifest.json`
+    of a direct build, records are looked up by input key; without it, by module name."""
+    g = LakeProject.load(project_dir).graph(targets)
+    idents = None
+    if manifest:
+        with open(manifest, encoding="utf-8") as fh:
+            idents = json.load(fh)["modules"]
+    return _assemble(g, store, dest_build_dir, idents=idents, token=token)
 
 
 def verify(project_dir: str, build_dir: str, reference: str | None = None, rehash: bool = True,
            leanchecker_jobs: int = 0, fresh_root: str | None = None, toolchain: str | None = None,
-           prefix_modules: str = "run", lake_check: bool = True) -> dict:
+           prefix_modules: str = "run", lake_check: bool = True, targets: list[str] | None = None) -> dict:
     """`lake_check=False` skips `lake build --no-build` (the direct backend writes no Lake traces)."""
     proj = LakeProject.load(project_dir)
-    g = proj.graph()
+    g = proj.graph(targets)
     tb = toolchain_bin(proj.project_dir, toolchain)
-    out = {"lake_no_build": lake_no_build(proj, build_dir, tb, rehash=rehash)} if lake_check else {}
+    out = {"lake_no_build": lake_no_build(proj, build_dir, tb, rehash=rehash, targets=targets)} if lake_check else {}
     if reference:
         out["compare"] = compare_builds(g, reference, build_dir)
     if leanchecker_jobs or fresh_root:
@@ -260,7 +411,8 @@ def verify(project_dir: str, build_dir: str, reference: str | None = None, rehas
     return out
 
 
-def reference_build(project_dir: str, build_dir: str, threads: int = 0, toolchain: str | None = None) -> dict:
+def reference_build(project_dir: str, build_dir: str, threads: int = 0, toolchain: str | None = None,
+                    targets: list[str] | None = None) -> dict:
     """A plain single-machine `lake build` into `build_dir` (for comparison and timing)."""
     proj = LakeProject.load(project_dir)
     tb = toolchain_bin(proj.project_dir, toolchain)
@@ -270,7 +422,7 @@ def reference_build(project_dir: str, build_dir: str, threads: int = 0, toolchai
         fh.write(proj.worker_lakefile(build_dir))
     t0 = time.time()
     code, out, wall, cpu, rss, _ = run_tracked(
-        [os.path.join(tb, "lake"), "-d", proj.project_dir, "-f", cfg, "--no-ansi", "build"],
+        [os.path.join(tb, "lake"), "-d", proj.project_dir, "-f", cfg, "--no-ansi", "build"] + list(targets or []),
         lake_env(tb, threads), 24 * 3600)
     secs = {}
     for mm in BUILT_RE.finditer(out):

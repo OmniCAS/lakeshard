@@ -11,7 +11,9 @@ library; the messages are the JSON of `lakeshard.protocol`. If sandboxes can rea
 directory but not each other over TCP, a file transport can implement the same four calls.
 
 Endpoints (POST, JSON in and out; `Authorization: Bearer <token>` when a token is set):
-- `/v1/register` `{worker, slots, threads, host, pid}` -> `{config: BuildConfig}`
+- `/v1/config` `{worker}` -> `{config: BuildConfig}` (the worker then computes its fingerprint)
+- `/v1/register` `{worker, slots, threads, host, pid, fingerprint}` -> `{config}`, or `{refused: why}`
+  when the worker's environment fingerprint differs from the coordinator's
 - `/v1/claim` `{worker, n, wait_s}` -> `{tasks: [ModuleTask], shutdown}` (waits up to `wait_s`)
 - `/v1/report` `{result: ModuleResult}` -> `{accepted}`; a successful result is accepted only
   after the coordinator sees the reported outputs (shared directory) or records (store)
@@ -44,7 +46,8 @@ from .store import open_store
 class BuildService:
     def __init__(self, graph: ProjectGraph, scheduler: ModuleScheduler, config: BuildConfig, work_dir: str,
                  token: str | None = None, host: str = "127.0.0.1", port: int = 0, claim_wait_cap_s: float = 30.0,
-                 store_root: str | None = None, advertise_host: str | None = None):
+                 store_root: str | None = None, advertise_host: str | None = None,
+                 fingerprint: dict | None = None, keys: dict[str, str] | None = None):
         self.g, self.s, self.cfg = graph, scheduler, config
         self.work = os.path.abspath(work_dir)
         os.makedirs(self.work, exist_ok=True)
@@ -67,6 +70,10 @@ class BuildService:
         if config.storage == "store":
             self.store = self.store_ep.store if self.store_ep else open_store(config.store, token=token)
         self.advertise_host = advertise_host
+        self.fingerprint = fingerprint
+        self.keys = keys or {}
+        self.module_of_key = {k: m for m, k in self.keys.items()}
+        self.refused: dict[str, dict] = {}
         self.dispatched: dict[str, tuple[float, float | None]] = {}  # task id -> (dispatch t, ready t)
         self.attempt_records: list[dict] = []
         self.clock: dict[str, list[float]] = {}  # worker -> samples of (worker clock - coordinator clock)
@@ -133,8 +140,8 @@ class BuildService:
                 n = int(self.headers.get("Content-Length") or 0)
                 try:
                     body = json.loads(self.rfile.read(n) or b"{}")
-                    fn = {"/v1/register": svc.register, "/v1/claim": svc.claim, "/v1/report": svc.report,
-                          "/v1/heartbeat": svc.heartbeat}.get(self.path)
+                    fn = {"/v1/config": svc.config, "/v1/register": svc.register, "/v1/claim": svc.claim,
+                          "/v1/report": svc.report, "/v1/heartbeat": svc.heartbeat}.get(self.path)
                     if fn is None:
                         return self._reply(404, {"error": "not found"})
                     return self._reply(200, fn(body))
@@ -212,11 +219,26 @@ class BuildService:
 
     # --- endpoints
 
+    def config(self, body: dict) -> dict:
+        return {"config": self.cfg, "server_time": time.time()}
+
     def register(self, body: dict) -> dict:
         wid = body["worker"]
+        if self.fingerprint is not None:
+            from .fingerprint import fingerprint_diff
+            fp = body.get("fingerprint") or {}
+            if fp.get("sha256") != self.fingerprint["sha256"]:
+                why = {"reason": "environment fingerprint differs",
+                       "parts": fingerprint_diff(self.fingerprint, fp) if fp else ["missing"],
+                       "host": body.get("host", "")}
+                with self.cond:
+                    self.refused[wid] = why
+                    self._log({"event": "refused", "worker": wid, **why})
+                return {"refused": why}
         with self.cond:
             now = time.time()
             self.s.register(wid, int(body.get("slots", 1)), now)
+            self.refused.pop(wid, None)
             self.worker_info[wid] = {"slots": int(body.get("slots", 1)), "threads": int(body.get("threads", 0)),
                                      "host": body.get("host", ""), "pid": body.get("pid"), "tasks": 0,
                                      "failed": 0, "lean_s": 0.0, "cpu_s": 0.0, "max_rss_bytes": 0}
@@ -235,6 +257,8 @@ class BuildService:
     def claim(self, body: dict) -> dict:
         wid, n = body["worker"], max(0, int(body.get("n", 1)))
         with self.cond:
+            if wid in self.refused or wid not in self.worker_info:
+                return {"tasks": [], "shutdown": False, "refused": self.refused.get(wid, {"reason": "not registered"})}
             self._note_clock(body)
         deadline = time.time() + min(float(body.get("wait_s", 0.0)), self.claim_wait_cap_s)
         with self.cond:
@@ -263,10 +287,10 @@ class BuildService:
             cancel = self.s.heartbeat(body["worker"], list(body.get("running", [])), now)
             return {"cancel": cancel, "shutdown": self.s.done(), "server_time": time.time()}
 
-    def _confirm(self, res: ModuleResult) -> str:
+    def _confirm(self, res: ModuleResult, ident: str) -> str:
         """'' if the outputs are visible to the coordinator, else the reason."""
         if self.cfg.storage == "store":
-            rec = self.store.get_records([res.module]).get(res.module)
+            rec = self.store.get_records([ident]).get(ident)
             if rec is None or not any(f.path.endswith(".olean") for f in rec.files):
                 return "no record with an .olean in the store"
             return ""
@@ -285,22 +309,32 @@ class BuildService:
         with self.cond:  # a report is a sign of life; its task must not expire while we check outputs
             self.s.touch(res.worker, t_report)
             live = res.task_id in self.s.running and self.s.running[res.task_id].worker == res.worker
+            ident = (self.s.running[res.task_id].task.key or res.module) if live else res.module
             if live:
                 self.s.confirming.add(res.task_id)
         t = time.time()
         if res.ok and live:
-            why = self._confirm(res)
+            why = self._confirm(res, ident)
             if why:
                 res.ok, res.error = False, why
+        dropped = []
+        for k in res.corrupt if live and self.store is not None else []:
+            if self.store.drop_record(k):  # an import's stored outputs are corrupt: build that module again
+                dropped.append(k)
         confirm_s = time.time() - t
         with self.cond:
             self.s.confirming.discard(res.task_id)
-            ev = self.s.complete(res.task_id, res.ok, time.time(), res.error) if live else None
+            for k in dropped:
+                m = self.module_of_key.get(k)
+                if m and self.s.invalidate(m, time.time()):
+                    self._log({"event": "invalidated", "module": m, "key": k, "reason": "corrupt objects in the store"})
+            kind = "corrupt" if res.corrupt else "error"
+            ev = self.s.complete(res.task_id, res.ok, time.time(), res.error, kind=kind) if live else None
             rec = {k: v for k, v in json.loads(dumps(res)).items() if k not in ("outputs", "log_tail")}
             rec["confirm_s"] = round(confirm_s, 4)
             rec["accepted"] = ev is not None
             if ev is not None:
-                rec.update({k: ev[k] for k in ("action", "released", "skipped") if k in ev})
+                rec.update({k: ev[k] for k in ("action", "released", "skipped", "class", "kind") if k in ev})
             if not res.ok:
                 rec["log_tail"] = res.log_tail[-1500:]
             self._log({"event": "result", **rec})
@@ -335,7 +369,7 @@ class BuildService:
             tt["failed_attempts"] += 1
             wi["failed"] += 1
             self.failures.append({"module": res.module, "worker": res.worker, "attempt": res.attempt,
-                                  "error": res.error[:500]})
+                                  "kind": "corrupt" if res.corrupt else "error", "error": res.error[:500]})
 
     # --- run records
 
@@ -371,6 +405,16 @@ class BuildService:
         with self.cond:
             return list(self.attempt_records)
 
+    def write_manifest(self, path: str) -> dict:
+        """Module -> input key of every module whose outputs are in the store after this run."""
+        with self.cond:
+            done = {m: self.keys.get(m, m) for m, v in self.s.state.items() if v == "done"}
+        man = {"schema": "lakeshard-build-manifest/1", "fingerprint": self.fingerprint, "store": self.cfg.store,
+               "modules": dict(sorted(done.items()))}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(man, fh, indent=0)
+        return man
+
     def write_records(self, path: str) -> int:
         recs = self.records()
         with open(path, "w", encoding="utf-8") as fh:
@@ -394,7 +438,12 @@ class BuildService:
             lb = lower_bound(self.g, self.module_seconds, slots)
             lb["ratio"] = round(wall / lb["bound_s"], 3) if lb["bound_s"] else None
             tt = {k: (round(v, 3) if isinstance(v, float) else v) for k, v in self.totals.items()}
+            failed = {m: self.s.failure_class.get(m, "") for m, v in self.s.state.items() if v == "failed"}
+            skipped = sorted(m for m, v in self.s.state.items() if v == "skipped")
             return {"ok": counts.get("done", 0) == len(self.g.modules), "backend": "lean",
+                    "from_store": len(self.s.cached), "built": len(self.module_seconds),
+                    "failed_modules": failed, "skipped_modules": skipped[:200], "skipped_count": len(skipped),
+                    "refused_workers": dict(self.refused),
                     "storage": self.cfg.storage, "build_dir": self.cfg.build_dir, "store": self.cfg.store,
                     "wall_s": round(wall, 2), "modules": len(self.g.modules), "status": counts,
                     "modules_built": counts.get("done", 0), "slots": slots, "lower_bound": lb, "totals": tt,
