@@ -30,11 +30,28 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--history")
     p.add_argument("--out", required=True)
 
-    b = sub.add_parser("build", help="build all shards on local worker processes")
+    b = sub.add_parser("build", help="build the project on several workers")
     b.add_argument("project")
     b.add_argument("--work", required=True, help="work directory (plan, store, workers, logs)")
-    b.add_argument("--workers", type=int, default=2)
-    b.add_argument("--threads", type=int, default=0, help="LEAN_NUM_THREADS per worker (0 = default)")
+    b.add_argument("--backend", choices=["lake", "lean"], default="lake",
+                   help="lake: batches of modules per `lake build` (default); lean: one `lean` per module")
+    b.add_argument("--workers", type=int, default=2, help="local worker processes")
+    b.add_argument("--threads", type=int, default=0,
+                   help="LEAN_NUM_THREADS (lake: per worker, also Lake's job count; lean: per lean process)")
+    b.add_argument("--slots", type=int, default=3, help="lean: concurrent lean processes per worker")
+    b.add_argument("--storage", choices=["shared", "store"], default="shared",
+                   help="lean: one shared build directory, or per-worker directories + store")
+    b.add_argument("--build-dir", help="lean, shared storage: the shared build directory (default <work>/build)")
+    b.add_argument("--listen", default="127.0.0.1:0", help="lean: coordinator address HOST:PORT (0 = any port)")
+    b.add_argument("--local-workers", type=int, help="lean: workers started here (default --workers; 0 = remote only)")
+    b.add_argument("--token-file", help="lean: shared secret for workers (default: a new one in <work>/token)")
+    b.add_argument("--visibility-timeout", type=float, default=0.0,
+                   help="lean: seconds to wait for outputs written elsewhere to appear (NFS)")
+    b.add_argument("--heavy-cost", type=float, help="lean: modules estimated at >= this many seconds ...")
+    b.add_argument("--heavy-threads", type=int, default=0, help="... get this many Lean threads")
+    b.add_argument("--lease", type=float, default=60.0, help="lean: seconds without heartbeat before a worker is lost")
+    b.add_argument("--keep-setup", action="store_true", help="lean: keep each module's .setup.json (as Lake does)")
+    b.add_argument("--wait-timeout", type=float, help="lean: give up after this many seconds")
     b.add_argument("--schedule", choices=["dynamic", "static"], default="dynamic")
     b.add_argument("--batch-cost", type=float, help="dynamic: estimated seconds of work per batch")
     b.add_argument("--plan", help="static: use this plan.json instead of planning")
@@ -44,7 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--history")
     b.add_argument("--retries", type=int, default=2)
     b.add_argument("--timeout", type=float, default=7200.0, help="seconds per shard job")
-    b.add_argument("--fail-once", action="append", default=[], help="shard id whose first attempt fails (test)")
+    b.add_argument("--fail-once", action="append", default=[],
+                   help="test: shard/batch id (lake) or module (lean) whose first attempt fails")
     b.add_argument("--toolchain-bin")
 
     s = sub.add_parser("assemble", help="put every module's outputs from the store into one build dir")
@@ -61,7 +79,15 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--fresh-root", help="also run leanchecker --fresh on this module")
     v.add_argument("--prefix-modules", choices=["run", "skip"], default="run",
                    help="modules that are also a name prefix of others (leanchecker re-checks their subtree)")
+    v.add_argument("--no-lake-check", action="store_true",
+                   help="skip `lake build --no-build` (direct-backend outputs carry no Lake traces)")
     v.add_argument("--toolchain-bin")
+
+    c = sub.add_parser("check-setup", help="compare the direct backend's lean invocations with a real Lake build")
+    c.add_argument("project")
+    c.add_argument("--lake-build-dir", required=True, help="build directory of a plain `lake build`")
+    c.add_argument("--limit", type=int, default=20)
+    c.add_argument("--toolchain-bin")
 
     r = sub.add_parser("reference", help="plain single-machine lake build into a build dir (timed)")
     r.add_argument("project")
@@ -85,6 +111,14 @@ def main(argv: list[str] | None = None) -> int:
     wr.add_argument("--result", required=True)
     wr.add_argument("--workspace", required=True)
     wr.add_argument("--worker-id", required=True)
+    ws = wsub.add_parser("serve", help="resident worker of the lean backend: pull tasks from a coordinator")
+    ws.add_argument("--coordinator", required=True, help="http://HOST:PORT")
+    ws.add_argument("--id", required=True, help="worker name (unique per build)")
+    ws.add_argument("--slots", type=int, default=1)
+    ws.add_argument("--threads", type=int, default=0, help="LEAN_NUM_THREADS per lean process (0 = default)")
+    ws.add_argument("--workspace", required=True, help="local directory for this worker")
+    ws.add_argument("--token-file", help="file with the coordinator's token (or env LAKESHARD_TOKEN)")
+    ws.add_argument("--give-up-s", type=float, default=300.0, help="exit when the coordinator is unreachable this long")
 
     args = ap.parse_args(argv)
     if args.cmd == "analyze":
@@ -93,6 +127,21 @@ def main(argv: list[str] | None = None) -> int:
         pl = api.plan(args.project, args.target_cost, args.shards, args.history)
         pl.save(args.out)
         _print(pl.stats)
+    elif args.cmd == "build" and args.backend == "lean":
+        rep = api.build_direct(args.project, args.work, workers=args.workers, slots=args.slots, threads=args.threads,
+                               storage=args.storage, build_dir=args.build_dir, store=args.store,
+                               history=args.history, retries=args.retries, timeout_s=args.timeout,
+                               fail_once=set(args.fail_once), toolchain=args.toolchain_bin, listen=args.listen,
+                               local_workers=args.local_workers, token_file=args.token_file,
+                               visibility_timeout_s=args.visibility_timeout, heavy_cost=args.heavy_cost,
+                               heavy_threads=args.heavy_threads, lease_s=args.lease, keep_setup=args.keep_setup,
+                               wait_timeout_s=args.wait_timeout)
+        _print({k: v for k, v in rep.items() if k not in ("workers",)})
+        return 0 if rep["ok"] else 1
+    elif args.cmd == "check-setup":
+        res = api.check_setup(args.project, args.lake_build_dir, args.toolchain_bin, args.limit)
+        _print(res)
+        return 0 if res["ok"] else 1
     elif args.cmd == "build":
         rep = api.build(args.project, args.work, workers=args.workers, threads=args.threads,
                         plan_obj=Plan.load(args.plan) if args.plan else None, schedule=args.schedule,
@@ -107,7 +156,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res["ok"] else 1
     elif args.cmd == "verify":
         res = api.verify(args.project, args.build_dir, args.reference, not args.no_rehash,
-                         args.leanchecker_jobs, args.fresh_root, args.toolchain_bin, args.prefix_modules)
+                         args.leanchecker_jobs, args.fresh_root, args.toolchain_bin, args.prefix_modules,
+                         lake_check=not args.no_lake_check)
         _print(res)
         return 0 if res["ok"] else 1
     elif args.cmd == "reference":
@@ -121,6 +171,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "worker" and args.wcmd == "run":
         from .worker import main_run
         return main_run(args.job, args.result, args.workspace, args.worker_id)
+    elif args.cmd == "worker" and args.wcmd == "serve":
+        from .pullworker import PullWorker, read_token
+        return PullWorker(args.coordinator, args.id, args.slots, args.threads, args.workspace,
+                          token=read_token(args.token_file), give_up_s=args.give_up_s).run()
     return 0
 
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lakeshard"
-version = "0.1.0"
+version = "0.2.0"
 description = "Split a Lean/Lake project along its import graph, build the shards on several workers, and assemble and verify the result."
 readme = "README.md"
 requires-python = ">=3.11"

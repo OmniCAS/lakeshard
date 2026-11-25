@@ -141,3 +141,70 @@ class ShardResult:
         kw = {f.name: d[f.name] for f in dataclasses.fields(ShardResult) if f.name in d}
         kw["records"] = [ModuleRecord.from_dict(r) for r in d.get("records", [])]
         return ShardResult(**kw)
+
+
+# --- direct `lean` backend: one task = one module, workers pull tasks from the coordinator
+
+
+@dataclass
+class BuildConfig:
+    """Sent to every worker when it registers: where the project, toolchain and outputs are."""
+
+    run_id: str
+    project_dir: str  # same absolute path on every worker
+    toolchain_bin: str  # directory with `lean` (same toolchain on every worker)
+    storage: str  # "shared": one build directory for all workers; "store": own directory + store
+    build_dir: str = ""  # storage=shared: the shared build directory (e.g. on NFS)
+    store: str = ""  # storage=store: artifact store location
+    visibility_timeout_s: float = 0.0  # wait this long for files written elsewhere to appear (NFS)
+    visibility_poll_s: float = 0.5
+    heartbeat_s: float = 5.0
+    keep_setup: bool = False  # keep each module's .setup.json next to its .c file (as Lake does)
+
+    @staticmethod
+    def from_dict(d: dict) -> "BuildConfig":
+        return BuildConfig(**{f.name: d[f.name] for f in dataclasses.fields(BuildConfig) if f.name in d})
+
+
+@dataclass
+class ModuleTask:
+    task_id: str
+    module: str
+    attempt: int = 1
+    threads: int = 0  # LEAN_NUM_THREADS for this module; 0 = the worker's default
+    timeout_s: float = 7200.0
+    needs: list[str] = field(default_factory=list)  # storage=store: import closure to fetch first
+    fail_on_purpose: bool = False  # test hook: report a failure without running lean
+
+    @staticmethod
+    def from_dict(d: dict) -> "ModuleTask":
+        return ModuleTask(**{f.name: d[f.name] for f in dataclasses.fields(ModuleTask) if f.name in d})
+
+
+@dataclass
+class ModuleResult:
+    task_id: str
+    module: str
+    worker: str
+    ok: bool
+    attempt: int = 1
+    outputs: list[FileRef] = field(default_factory=list)  # paths relative to the build directory
+    started: float = 0.0  # unix time
+    wall_s: float = 0.0  # whole task on the worker
+    lean_s: float = 0.0  # the lean process (plus leanir, if any)
+    cpu_s: float = 0.0
+    max_rss_bytes: int = 0
+    wait_s: float = 0.0  # waiting for imported outputs to become visible
+    fetch_s: float = 0.0  # storage=store: fetching imports from the store
+    fetched_bytes: int = 0
+    publish_s: float = 0.0  # moving outputs into place / uploading them
+    threads: int = 0
+    exit_code: int | None = None
+    error: str = ""
+    log_tail: str = ""
+
+    @staticmethod
+    def from_dict(d: dict) -> "ModuleResult":
+        kw = {f.name: d[f.name] for f in dataclasses.fields(ModuleResult) if f.name in d}
+        kw["outputs"] = [FileRef.from_dict(x) for x in d.get("outputs", [])]
+        return ModuleResult(**kw)

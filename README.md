@@ -7,9 +7,11 @@ directory and check it.
 The aim is to make very large Lean repositories (hundreds of thousands of modules) buildable in
 the time of their critical path instead of the time one machine needs for all the work.
 
-Status: 0.1, tested on one machine simulating several workers (see "Stages" below). Remote
-workers are not implemented yet; the core is a library with plain JSON messages so that an HTTP
-or queue front end can be added without rewriting it.
+Status: 0.2. Two backends: batches of modules built by stock `lake build` (0.1), and one `lean`
+process per module with Lake's exact arguments, pulled by resident workers from a small HTTP
+coordinator and written into one shared build directory (0.2, milestone M1). Both are tested on
+one machine (see "Stages" below); the worker command for other machines is in "Remote workers",
+runs on real separate machines have not been done yet.
 
 ## Install
 
@@ -26,15 +28,25 @@ Lean toolchain installed through elan.
 lakeshard analyze PROJECT                      # modules, edges, depth, critical-path estimates
 lakeshard plan PROJECT --shards 32 --out plan.json
 lakeshard reference PROJECT --build-dir REF    # plain single-machine lake build, timed
-lakeshard build PROJECT --work WORK --workers 4 --threads 3
+lakeshard build PROJECT --work WORK --workers 4 --threads 3          # Lake batch backend
+lakeshard build PROJECT --work WORK --backend lean --workers 4 --slots 3 --threads 3   # direct backend
+lakeshard worker serve --coordinator URL --id NAME --slots 3 --threads 3 --workspace DIR --token-file F
+lakeshard check-setup PROJECT --lake-build-dir REF   # direct backend's lean calls vs a real lake build
 lakeshard assemble PROJECT --store WORK/store --dest OUT
 lakeshard verify PROJECT --build-dir OUT --reference REF --leanchecker-jobs 8 [--prefix-modules skip]
 lakeshard synth OUT --modules 200              # synthetic project for tests and benchmarks
 ```
 
-`build` options: `--schedule dynamic|static`, `--batch-cost SECONDS` (dynamic), `--plan` /
-`--shards` / `--target-cost` (static), `--retries`, `--timeout`, `--store DIR`,
+`build` options (Lake batch backend, the default): `--schedule dynamic|static`, `--batch-cost SECONDS`
+(dynamic), `--plan` / `--shards` / `--target-cost` (static), `--retries`, `--timeout`, `--store DIR`,
 `--fail-once ID` (test hook: the first attempt of that batch or shard fails).
+
+`build --backend lean` options: `--workers N` (started on this machine), `--slots K` (`lean`
+processes per worker), `--threads T` (`LEAN_NUM_THREADS` per `lean`), `--storage shared|store`,
+`--build-dir DIR` (the shared build directory, default `WORK/build`), `--listen HOST:PORT`,
+`--local-workers N` (0: only remote workers), `--token-file F`, `--visibility-timeout S` (NFS),
+`--heavy-cost S --heavy-threads T` (more threads for modules estimated at >= S seconds; not tuned),
+`--lease S`, `--keep-setup`, `--retries`, `--timeout`, `--history`, `--fail-once MODULE`.
 
 All commands print JSON. `build` writes `WORK/report.json`, `WORK/events.jsonl` (one line per
 job), `WORK/history.json` (measured seconds per module, used for later cost estimates) and keeps
@@ -71,6 +83,90 @@ each worker's workspace under `WORK/workers/`.
    reference build, and replays every module through the kernel with `leanchecker` (optionally
    `leanchecker --fresh` on a root module).
 
+### Direct `lean` backend (`--backend lean`)
+
+One task = one module. The worker writes the module's `--setup` JSON and runs
+`lean <weakLeanArgs> <moreLeanArgs> <absolute source> -o … -i … -c … --setup … --json` with
+`LEAN_PATH` set, exactly as Lake 4.33-4.35 does (`lakeshard/lakeenv.py` follows Lake's
+`fetchTransImportArts`, `computeExportInfo`, `mkModuleSetup`, `compileLeanModule` and
+`Workspace.leanPath`): module name, package name, `isModule`, the module's library options
+(build type, package and library `leanOptions`), `importArts` (every transitive workspace import
+for a plain file; `public`/`meta`/`all` edges for `module` files; dependency modules such as
+Mathlib's with their `.olean`, `.olean.server`, `.olean.private`, `.ir.sig`, `.ir`), and
+`LEAN_PATH` (dependencies in reverse manifest order, then the project). `lakeshard check-setup`
+compares all of it with the `.setup.json` files and `.trace` command lines of a real `lake build`.
+Only `lakefile.toml` projects; dependencies must already be built (e.g. `lake exe cache get`);
+`precompileModules`, `dynlibs`, `plugins`, `needs`/`extraDepTargets`, other target kinds and Lake's
+artifact cache are refused or not reproduced. No Lake `.trace`/`.hash` files are written, so Lake
+does not yet accept these outputs as up to date (milestone M3).
+
+- **Storage.** `shared` (default): all workers read and write one build directory (later on NFS).
+  `lean` writes into `BUILD/.lakeshard-tmp/<task>/`; the outputs are then renamed into place,
+  the `.olean` last; the module's stale Lake metadata (`.trace`, `*.hash`) is removed. The
+  coordinator releases importers only after it sees the reported files with the reported sizes.
+  On NFS, `--visibility-timeout S` makes workers (before `lean`, for the outputs of the direct
+  imports) and the coordinator (before releasing importers) re-read the directories and wait up
+  to S seconds. `store`: each worker has its own build directory and exchanges outputs through
+  the sha256 store, as the batch backend does (kept as the control).
+- **Scheduling** (`lakeshard/scheduler.py`, a pure state machine): ready modules by longest
+  remaining path (measured seconds from `--history`, else the line-count estimate); a failed
+  module is retried on a worker that has not failed it (when one is alive), and after `--retries`
+  retries everything importing it is skipped; a worker not heard from for `--lease` seconds is
+  presumed lost and its tasks go elsewhere; a worker still running a reassigned task is told to
+  cancel it; late results of reassigned tasks are ignored.
+- **Workers** (`lakeshard/pullworker.py`) are resident processes: register, long-poll `claim` for
+  as many tasks as they have free slots, `report` each result, `heartbeat` every 5 s.
+- **Transport: HTTP**, standard library only, JSON messages from `lakeshard.protocol`
+  (`BuildConfig`, `ModuleTask`, `ModuleResult`), a random bearer token (`WORK/token`). Chosen
+  over task files in the shared directory because every link of an import chain waits for a
+  dispatch decision: a long-polled request delivers it in milliseconds from one process that
+  holds all state, whereas files on NFS need cross-client claiming by rename and directory
+  polling, and NFS attribute caching (3-60 s) would add that delay to every dependency (the
+  simulations show 5-30 s per dependency doubling the critical path of a deep archive). If
+  sandboxes share a directory but cannot reach each other over TCP, a file transport can
+  implement the same four calls.
+- **Report** (`WORK/report.json`): wall time, per-module `lean` seconds (also `WORK/history.json`),
+  CPU, largest RSS, waits, failures, and the lower bound max(critical path, total work / slots)
+  with the ratio wall / bound. `WORK/events.jsonl`: one line per dispatch, result and expiry.
+
+### Remote workers (direct backend)
+
+Machines are called by role here: `hub` runs the coordinator, `worker-1`, `worker-2`, ... run
+workers. `<shared>` is a directory every machine mounts at the same path, `<local>` a directory
+on one machine only.
+
+The cross-machine form planned next (milestone S2) gives every worker its own local build
+directory and moves outputs through an artifact store (a shared directory or HTTP); that is
+`--storage store` today with a directory store. `--storage shared` (one build directory for all,
+e.g. on NFS) is the single-machine form of S1 and stays as a control.
+
+On `hub` (no local workers, listening on an address the workers can reach):
+
+```bash
+lakeshard build <project> --backend lean --work <local>/work --storage store --store <shared>/store --listen 0.0.0.0:8765 --local-workers 0
+```
+
+`<local>/work/coordinator.json` holds the URL; copy `<local>/work/token` to each worker and run there:
+
+```bash
+lakeshard worker serve --coordinator http://hub:8765 --id worker-1 --slots 8 --threads 2 --workspace <local>/worker-1 --token-file <local>/token
+```
+
+Preconditions on every worker machine (not checked automatically yet):
+
+1. the project source at the **same absolute path** as on `hub` (Lean stores the source path of
+   modules with linter messages in their `.olean`), e.g. a checkout of the same commit there;
+2. the **same toolchain** at the same path (`elan toolchain install` of the project's
+   `lean-toolchain`; the coordinator sends the path of its `bin` directory);
+3. the **dependencies built** at the same paths (`<project>/.lake/packages/*/.lake/build`, e.g. from
+   `lake exe cache get`), identical to those on `hub`;
+4. the store reachable at the same path (`--storage store`), or the shared build directory
+   mounted read-write at the same path (`--storage shared`; then also `--visibility-timeout`);
+5. TCP from the worker to the coordinator's port; Linux machines building Mathlib-sized closures
+   may need a higher `vm.max_map_count` than the default 65530.
+
+Workers run the project's code (tactics, metaprograms): run them in sandboxes without credentials.
+
 ### Rules that make outputs identical
 
 - The project source must be at the **same absolute path** on every worker. Lean 4.33 stores the
@@ -97,6 +193,9 @@ api.assemble(project, store, dest)
 api.verify(project, dest, reference=ref, leanchecker_jobs=8)
 ```
 
+`api.build_direct(project, work, workers=4, slots=3, threads=3, storage="shared")` runs the direct
+backend; `api.check_setup(project, lake_build_dir)` compares its `lean` calls with Lake's.
+
 Messages (`lakeshard.protocol`, all JSON-serialisable dataclasses): `Plan` / `ShardSpec`,
 `ShardJob` (modules to build, modules needed, project and toolchain, store location),
 `ShardResult` (records produced, timings, CPU, peak RSS, bytes moved, error),
@@ -111,8 +210,9 @@ A remote executor or an HTTP service would send the same job JSON.
 |---|---|---|
 | a | tiny synthetic project (tests) | `pytest`: 40 modules, 3 worker processes, static and dynamic schedules, injected failure retried, assembled build identical to `lake build`, `--no-build --rehash` and `leanchecker` pass |
 | b | one machine simulating several workers on synthetic projects with the shape of real import graphs | 2,613 modules: 4 workers x 3 threads, 343 s (`lake build` 278 s); 7,839 files identical; `--no-build --rehash` and `leanchecker` (2,613/2,613) pass |
-| c | a real Mathlib-based project (odd-singular-vector, 230 modules) | 4 x 2: 597 s (`lake build` 8 threads 503 s; critical path 444 s, so at most 4.65x on any number of machines); 690 files identical; `--no-build --rehash` and `leanchecker` pass |
-| d | sandboxes / remote workers | not started |
+| c | a mid-sized private project that depends on Mathlib (230 modules) | 4 x 2: 597 s (`lake build` 8 threads 503 s; critical path 444 s, so at most 4.65x on any number of machines); 690 files identical; `--no-build --rehash` and `leanchecker` pass |
+| S1 | direct `lean` backend, pull workers over HTTP, shared build directory (one machine) | `lean` calls identical to Lake's (setup, command line, `LEAN_PATH`) for 40 + 316 + 6 + 230 modules; outputs identical to `lake build` (120, 948, 34 files); 316 modules 18.3 s vs `lake build` 17.8 s, 1.05 of the lower bound |
+| d | sandboxes / remote workers | not started (S2-S4) |
 
 ## Design notes
 
@@ -121,7 +221,8 @@ A remote executor or an HTTP service would send the same job JSON.
   infrastructure and model orchestration.
 - `docs/research/`: the research notes behind it (Omega Institute's sharded build, Isabelle's cluster
   build, Mathlib/Lake caching, analysis tools).
-- `docs/stages.md`: measurements of stages a-c.
+- `docs/stages.md`: measurements of stages a-c and S1.
+- `docs/plan.zh.md` (Chinese): goal (repository in, build cache out), pipeline, robustness rules, acceptance tiers, steps S1-S5 and the decision record.
 
 ## Tests
 

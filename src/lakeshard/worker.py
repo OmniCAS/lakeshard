@@ -30,11 +30,16 @@ def _seconds(num: str | None, unit: str | None) -> float | None:
     return x / 1000 if unit == "ms" else x * 60 if unit == "min" else x
 
 
-def run_tracked(cmd: list[str], env: dict, timeout_s: float, cwd: str | None = None):
-    """Run a command; return (exit code, output, wall s, cpu s, max RSS bytes, timed out)."""
+def run_tracked(cmd: list[str], env: dict, timeout_s: float, cwd: str | None = None, on_start=None):
+    """Run a command; return (exit code, output, wall s, cpu s, max RSS bytes, timed out).
+
+    `on_start(proc)` is called once the process exists (e.g. to register it for cancellation; the
+    process is the leader of its own process group)."""
     t0 = time.time()
     proc = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             start_new_session=True)
+    if on_start is not None:
+        on_start(proc)
     chunks: list[bytes] = []
     reader = threading.Thread(target=lambda: chunks.append(proc.stdout.read()))
     reader.start()

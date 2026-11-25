@@ -59,3 +59,36 @@ def write_project(out: str, imports: list[list[int]], toolchain: str = "leanprov
     with open(os.path.join(out, "synth.json"), "w") as fh:
         json.dump(summary, fh)
     return summary
+
+
+MODULE_SYSTEM_FILES = {
+    "ModSys/A.lean": "module\n\npublic def ModSys.a : Nat := 1\n\ndef ModSys.secret : Nat := 2\n",
+    "ModSys/B.lean": "module\n\npublic import ModSys.A\n\npublic def ModSys.b : Nat := ModSys.a + 1\n",
+    "ModSys/C.lean": ("module\n\nimport all ModSys.A\npublic import ModSys.B\n\n"
+                      "def ModSys.c : Nat := ModSys.b + ModSys.secret\n"),
+    "ModSys/D.lean": "module\n\nmeta import ModSys.A\npublic import ModSys.C\n\npublic def ModSys.d : Nat := ModSys.b\n",
+    "ModSys/E.lean": ("import ModSys.D\n\ndef ModSys.e : Nat := ModSys.d\n\n"
+                      "theorem ModSys.warned (h : 1 = 1) : True := trivial\n"),
+    "Extra/X.lean": "import ModSys.E\n\ntheorem Extra.x : ModSys.e = ModSys.e := rfl\n",
+}
+
+
+def write_module_system_project(out: str, toolchain: str = "leanprover/lean4:v4.35.0") -> dict:
+    """A small project mixing `module` files (public/meta/all imports) and plain files, with two
+    libraries that have different options and arguments; for checking the direct backend."""
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "lean-toolchain"), "w") as fh:
+        fh.write(toolchain + "\n")
+    with open(os.path.join(out, "lakefile.toml"), "w") as fh:
+        fh.write('name = "modsys"\ndefaultTargets = ["ModSys", "Extra"]\nmoreLeanArgs = ["--tstack=400000"]\n'
+                 'weakLeanArgs = ["-DmaxRecDepth=600"]\n\n[leanOptions]\nautoImplicit = false\n'
+                 'linter.unusedVariables = true\n\n'
+                 '[[lean_lib]]\nname = "ModSys"\nglobs = ["ModSys.+"]\n\n'
+                 '[[lean_lib]]\nname = "Extra"\nglobs = ["Extra.+"]\nmoreLeanArgs = ["--tstack=300000"]\n'
+                 'leanOptions = { maxHeartbeats = 300000, linter = { unusedVariables = false } }\n')
+    for rel, text in MODULE_SYSTEM_FILES.items():
+        p = os.path.join(out, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            fh.write(text)
+    return {"modules": len(MODULE_SYSTEM_FILES), "toolchain": toolchain}

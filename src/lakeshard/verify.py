@@ -30,7 +30,7 @@ def lake_no_build(project: LakeProject, build_dir: str, toolchain_bin: str, reha
 
 
 def compare_builds(graph: ProjectGraph, reference_dir: str, test_dir: str,
-                   suffixes=(".olean", ".ilean", ".c", ".olean.server", ".olean.private", ".ir")) -> dict:
+                   suffixes=(".olean", ".ilean", ".c", ".olean.server", ".olean.private", ".ir", ".ir.sig")) -> dict:
     """Compare the outputs of every module (traces and hash files excluded: they hold paths)."""
     same = 0
     diff, missing = [], []

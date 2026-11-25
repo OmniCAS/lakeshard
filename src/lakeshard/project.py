@@ -36,13 +36,77 @@ def toolchain_bin(project_dir: str, override: str | None = None) -> str:
     return path
 
 
+def flatten_lean_options(v) -> dict:
+    """Lake's TOML decoding of `leanOptions`: a table (nested tables give dotted names), or an array
+    of `[name, value]` pairs or `{name, value}` tables. Values: string, boolean, natural number."""
+    out: dict = {}
+
+    def walk(prefix: str, x) -> None:
+        if isinstance(x, dict):
+            for k, y in x.items():
+                walk(f"{prefix}.{k}" if prefix else k, y)
+        else:
+            out[prefix] = x
+
+    if isinstance(v, dict):
+        walk("", v)
+    elif isinstance(v, list):
+        for item in v:
+            if isinstance(item, list) and len(item) == 2:
+                out[str(item[0])] = item[1]
+            elif isinstance(item, dict) and "name" in item:
+                out[str(item["name"])] = item.get("value")
+            else:
+                raise ProjectError(f"cannot read leanOptions entry {item!r}")
+    elif v is not None:
+        raise ProjectError(f"leanOptions must be a table or an array, not {v!r}")
+    return out
+
+
+def _str_list(v) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    return [str(x) for x in v]
+
+
+def name_is_prefix(prefix: str, name: str) -> bool:
+    """`Lean.Name.isPrefixOf` on dotted names (by components)."""
+    return name == prefix or name.startswith(prefix + ".")
+
+
+def glob_matches(glob: str, mod: str) -> bool:
+    """Lake globs: `A.B` (exactly), `A.B.+` (strict submodules), `A.B.*` (itself and submodules)."""
+    if glob.endswith(".+"):
+        return mod.startswith(glob[:-2] + ".")
+    if glob.endswith(".*"):
+        return name_is_prefix(glob[:-2], mod)
+    return mod == glob
+
+
+# Lake configuration keys the direct-`lean` backend does not reproduce (it refuses to run then).
+DIRECT_UNSUPPORTED_KEYS = ("precompileModules", "dynlibs", "plugins", "extraDepTargets", "needs",
+                           "nativeFacets", "defaultFacets", "platformIndependent")
+
+
 @dataclass
 class LeanLib:
     name: str
     src_dir: str  # relative to the package source directory
     roots: list[str]
     globs: list[str]
-    lean_options: dict = field(default_factory=dict)
+    lean_options: dict = field(default_factory=dict)  # flattened (dotted names)
+    more_lean_args: list[str] = field(default_factory=list)
+    weak_lean_args: list[str] = field(default_factory=list)
+    build_type: str = ""  # "" = the package's
+    unsupported: list[str] = field(default_factory=list)
+
+    def is_buildable(self, mod: str) -> bool:
+        """`LeanLibConfig.isBuildableModule`."""
+        return (any(glob_matches(g, mod) for g in self.globs)
+                or any(name_is_prefix(r, mod) and any(glob_matches(g, r) for g in self.globs)
+                       for r in self.roots))
 
 
 @dataclass
@@ -119,7 +183,11 @@ class LakeProject:
     build_dir: str
     libs: list[LeanLib]
     default_targets: list[str]
-    lean_options: dict
+    lean_options: dict  # flattened (dotted names)
+    more_lean_args: list[str] = field(default_factory=list)
+    weak_lean_args: list[str] = field(default_factory=list)
+    build_type: str = "release"
+    unsupported: list[str] = field(default_factory=list)  # keys the direct backend cannot reproduce
 
     @staticmethod
     def load(project_dir: str) -> "LakeProject":
@@ -143,11 +211,43 @@ class LakeProject:
             if isinstance(globs, str):
                 globs = [globs]
             libs.append(LeanLib(lib["name"], lib.get("srcDir", "."), list(roots), list(globs),
-                                dict(lib.get("leanOptions", {}))))
+                                flatten_lean_options(lib.get("leanOptions")),
+                                _str_list(lib.get("moreLeanArgs")), _str_list(lib.get("weakLeanArgs")),
+                                str(lib.get("buildType", "")),
+                                [f"lean_lib {lib['name']}: {k}" for k in DIRECT_UNSUPPORTED_KEYS if k in lib]))
         dt = cfg.get("defaultTargets") or [l.name for l in libs]
+        unsupported = [k for k in DIRECT_UNSUPPORTED_KEYS if k in cfg]
+        if cfg.get("lean_exe") or cfg.get("extern_lib") or cfg.get("input_file") or cfg.get("input_dir"):
+            unsupported.append("targets other than lean_lib")
         return LakeProject(project_dir, toml_path, name, cfg.get("srcDir", "."),
                            cfg.get("buildDir", os.path.join(".lake", "build")), libs, list(dt),
-                           dict(cfg.get("leanOptions", {})))
+                           flatten_lean_options(cfg.get("leanOptions")),
+                           _str_list(cfg.get("moreLeanArgs")), _str_list(cfg.get("weakLeanArgs")),
+                           str(cfg.get("buildType", "release")), unsupported)
+
+    # --- per-module configuration, as Lake computes it (Lake/Config/{Module,LeanLib}.lean, 4.33-4.35)
+
+    def lib_of(self, module: str) -> LeanLib | None:
+        """The library a module belongs to: `Package.findModule?` searches the libraries last to first."""
+        for lib in reversed(self.libs):
+            if lib.is_buildable(module):
+                return lib
+        return None
+
+    def lib_src_root(self, lib: LeanLib) -> str:
+        return os.path.normpath(os.path.join(self.project_dir, self.src_dir, lib.src_dir))
+
+    def lean_options_of(self, lib: LeanLib) -> dict:
+        """buildType options ++ package `leanOptions` ++ library `leanOptions` (later entries win)."""
+        bt = (lib.build_type or self.build_type or "release").lower()
+        out: dict = {"debugAssertions": True} if bt == "debug" else {}
+        out.update(self.lean_options)
+        out.update(lib.lean_options)
+        return out
+
+    def lean_args_of(self, lib: LeanLib) -> list[str]:
+        """`weakLeanArgs` (package, library) then `moreLeanArgs` (package, library), as Lake passes them."""
+        return self.weak_lean_args + lib.weak_lean_args + self.more_lean_args + lib.more_lean_args
 
     # --- modules
 
