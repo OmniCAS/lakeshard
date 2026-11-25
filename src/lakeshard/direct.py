@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import threading
 import time
 
@@ -68,8 +69,10 @@ def wait_visible(paths: list[str], timeout_s: float, poll_s: float = 0.5,
 class ModuleBuilder:
     """Worker side of the direct backend; one per worker process, used by several slots at once."""
 
-    def __init__(self, cfg: BuildConfig, worker_id: str, workspace: str, default_threads: int = 0):
+    def __init__(self, cfg: BuildConfig, worker_id: str, workspace: str, default_threads: int = 0,
+                 token: str | None = None):
         self.cfg, self.worker_id, self.default_threads = cfg, worker_id, default_threads
+        self.host = socket.gethostname()
         self.workspace = os.path.abspath(workspace)
         proj = LakeProject.load(cfg.project_dir)
         if cfg.storage == "shared":
@@ -83,7 +86,7 @@ class ModuleBuilder:
         os.makedirs(self.build_dir, exist_ok=True)
         self.ws = LakeWorkspace(proj, self.build_dir, cfg.toolchain_bin)
         self.ws.check_supported()
-        self.store = open_store(cfg.store) if cfg.storage == "store" else None
+        self.store = open_store(cfg.store, token=token) if cfg.storage == "store" else None
         self.present: dict[str, str] = {}  # storage=store: module -> digest of the record present here
         self.lock = threading.Lock()
         self.procs: dict[str, object] = {}
@@ -108,7 +111,7 @@ class ModuleBuilder:
         t0 = time.time()
         threads = task.threads or self.default_threads
         res = ModuleResult(task.task_id, task.module, self.worker_id, ok=False, attempt=task.attempt,
-                           started=t0, threads=threads)
+                           started=t0, threads=threads, host=self.host)
         tmp = os.path.join(self.tmp_root, f"{self.cfg.run_id}-{task.task_id}-{os.getpid()}")
         try:
             if task.fail_on_purpose:
@@ -139,8 +142,10 @@ class ModuleBuilder:
                     if tid in self.cancelled:
                         os.killpg(proc.pid, signal.SIGKILL)
 
+            res.lean_start = time.time()
             code, out, wall, cpu, rss, timed_out = run_tracked(self.ws.lean_command(m, outs, setup_path), env,
                                                              task.timeout_s, on_start=started)
+            res.lean_end = time.time()
             res.lean_s, res.cpu_s, res.max_rss_bytes, res.exit_code = wall, cpu, rss, code
             res.log_tail = out[-4000:]
             if code == 0 and self.ws.postpone_compile(m):
@@ -151,6 +156,7 @@ class ModuleBuilder:
                 res.max_rss_bytes = max(res.max_rss_bytes, rss)
                 res.exit_code = code
                 res.log_tail = (out + out2)[-4000:]
+                res.lean_end = time.time()
             with self.lock:
                 self.procs.pop(task.task_id, None)
                 was_cancelled = task.task_id in self.cancelled
@@ -169,7 +175,8 @@ class ModuleBuilder:
             res.error = f"{type(e).__name__}: {e}"
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-            res.wall_s = time.time() - t0
+            res.ended = time.time()
+            res.wall_s = res.ended - t0
         return res
 
     def _wait_imports(self, m: str, import_arts: dict, res: ModuleResult) -> None:
@@ -185,22 +192,28 @@ class ModuleBuilder:
             raise RuntimeError(f"{len(missing)} imported outputs not visible after {waited:.1f} s, e.g. {missing[0]}")
 
     def _fetch(self, task: ModuleTask, res: ModuleResult) -> None:
+        """Bring the outputs of the module's import closure into this worker's build directory.
+
+        Modules already here (built or fetched earlier in this run) are not asked for again: within
+        a run a module's outputs do not change (a rebuilt module has the same bytes)."""
         t = time.time()
-        recs = self.store.get_records(task.needs)
-        missing = [u for u in task.needs if u not in recs]
+        with self.lock:
+            want = [u for u in task.needs if u not in self.present]
+        recs = self.store.get_records(want) if want else {}
+        missing = [u for u in want if u not in recs]
         if missing:
             raise RuntimeError(f"store has no outputs for {len(missing)} needed modules, e.g. {missing[:3]}")
-        for u in task.needs:
+        for u in want:
             r = recs[u]
-            d = r.digest()
             with self.lock:
-                if self.present.get(u) == d:
+                if u in self.present:
                     continue
             for f in r.files:
                 self.store.get_file(f, os.path.join(self.build_dir, f.path))
                 res.fetched_bytes += f.size
+                res.fetched_files += 1
             with self.lock:
-                self.present[u] = d
+                self.present[u] = r.digest()
         res.fetch_s = time.time() - t
 
     def _publish(self, m: str, outs: dict[str, str], final: dict[str, str], res: ModuleResult) -> None:

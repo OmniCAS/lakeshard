@@ -39,8 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--threads", type=int, default=0,
                    help="LEAN_NUM_THREADS (lake: per worker, also Lake's job count; lean: per lean process)")
     b.add_argument("--slots", type=int, default=3, help="lean: concurrent lean processes per worker")
-    b.add_argument("--storage", choices=["shared", "store"], default="shared",
-                   help="lean: one shared build directory, or per-worker directories + store")
+    b.add_argument("--storage", choices=["store", "shared"], default="store",
+                   help="lean: per-worker build directories + artifact store (default), or one shared build directory")
     b.add_argument("--build-dir", help="lean, shared storage: the shared build directory (default <work>/build)")
     b.add_argument("--listen", default="127.0.0.1:0", help="lean: coordinator address HOST:PORT (0 = any port)")
     b.add_argument("--local-workers", type=int, help="lean: workers started here (default --workers; 0 = remote only)")
@@ -57,7 +57,9 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--plan", help="static: use this plan.json instead of planning")
     b.add_argument("--target-cost", type=float)
     b.add_argument("--shards", type=int)
-    b.add_argument("--store", help="artifact store directory (default <work>/store)")
+    b.add_argument("--store", help="artifact store: a directory, or http://HOST:PORT of `lakeshard store serve` "
+                                   "(default: <work>/store; for --backend lean served by the coordinator over HTTP)")
+    b.add_argument("--advertise-host", help="lean: host name or address workers use to reach the coordinator")
     b.add_argument("--history")
     b.add_argument("--retries", type=int, default=2)
     b.add_argument("--timeout", type=float, default=7200.0, help="seconds per shard job")
@@ -104,6 +106,13 @@ def main(argv: list[str] | None = None) -> int:
     y.add_argument("--toolchain", default="leanprover/lean4:v4.33.1")
     y.add_argument("--random-state", type=int, default=1)
 
+    st = sub.add_parser("store", help="artifact store server")
+    stsub = st.add_subparsers(dest="scmd", required=True)
+    sts = stsub.add_parser("serve", help="serve a store directory over HTTP")
+    sts.add_argument("--root", required=True)
+    sts.add_argument("--listen", default="127.0.0.1:0", help="HOST:PORT")
+    sts.add_argument("--token-file", help="require this bearer token")
+
     w = sub.add_parser("worker", help="worker side (used by executors)")
     wsub = w.add_subparsers(dest="wcmd", required=True)
     wr = wsub.add_parser("run", help="run one shard job file")
@@ -135,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
                                local_workers=args.local_workers, token_file=args.token_file,
                                visibility_timeout_s=args.visibility_timeout, heavy_cost=args.heavy_cost,
                                heavy_threads=args.heavy_threads, lease_s=args.lease, keep_setup=args.keep_setup,
-                               wait_timeout_s=args.wait_timeout)
+                               wait_timeout_s=args.wait_timeout, advertise_host=args.advertise_host)
         _print({k: v for k, v in rep.items() if k not in ("workers",)})
         return 0 if rep["ok"] else 1
     elif args.cmd == "check-setup":
@@ -171,6 +180,18 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "worker" and args.wcmd == "run":
         from .worker import main_run
         return main_run(args.job, args.result, args.workspace, args.worker_id)
+    elif args.cmd == "store" and args.scmd == "serve":
+        from .httpstore import serve_store
+        from .pullworker import read_token
+        host, _, port = args.listen.rpartition(":")
+        srv = serve_store(args.root, host or "127.0.0.1", int(port or 0), token=read_token(args.token_file))
+        print(json.dumps({"url": f"http://{srv.server_address[0]}:{srv.server_address[1]}", "root": args.root}),
+              flush=True)
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        return 0
     elif args.cmd == "worker" and args.wcmd == "serve":
         from .pullworker import PullWorker, read_token
         return PullWorker(args.coordinator, args.id, args.slots, args.threads, args.workspace,

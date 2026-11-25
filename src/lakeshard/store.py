@@ -1,8 +1,10 @@
 """Content-addressed artifact store.
 
 Objects are files named by their sha256; a module record lists the files a module produced.
-`LocalStore` keeps both in a directory (shared disk, or one machine simulating several). A remote
-store (HTTP or S3-compatible) can implement the same five methods.
+Two implementations of the same five methods: `LocalStore` keeps both in a directory (a local
+disk, or a directory every worker mounts), `HttpStore` (`httpstore.py`) talks to a store served
+over HTTP by the coordinator or by `lakeshard store serve`. Every download is checked against its
+sha256 on the receiving side.
 """
 from __future__ import annotations
 
@@ -35,11 +37,15 @@ class ArtifactStore:
     def has_object(self, sha: str) -> bool: ...
 
 
-def open_store(location: str) -> ArtifactStore:
+def open_store(location: str, token: str | None = None) -> ArtifactStore:
+    """A directory path (or `file://` URL) or an `http://` URL of a store server."""
     if location.startswith("file://"):
         location = location[len("file://"):]
+    if location.startswith(("http://", "https://")):
+        from .httpstore import HttpStore
+        return HttpStore(location, token=token)
     if "://" in location:
-        raise ValueError(f"unsupported store location {location!r} (only directories so far)")
+        raise ValueError(f"unsupported store location {location!r}")
     return LocalStore(location)
 
 

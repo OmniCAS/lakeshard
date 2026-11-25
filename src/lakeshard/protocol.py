@@ -202,6 +202,11 @@ class ModuleResult:
     exit_code: int | None = None
     error: str = ""
     log_tail: str = ""
+    host: str = ""  # the worker machine's host name
+    lean_start: float = 0.0  # unix time on the worker's clock
+    lean_end: float = 0.0
+    ended: float = 0.0
+    fetched_files: int = 0
 
     @staticmethod
     def from_dict(d: dict) -> "ModuleResult":

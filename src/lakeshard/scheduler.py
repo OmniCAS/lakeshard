@@ -60,6 +60,7 @@ class ModuleScheduler:
         self.workers: dict[str, dict] = {}
         self.errors: dict[str, list[str]] = defaultdict(list)
         self.confirming: set[str] = set()  # task ids whose outputs the caller is checking; never expired
+        self.ready_at: dict[str, float | None] = {}  # when each module last became ready (None: at start)
         self._seq = itertools.count(1)
         self._terminal = 0
         for m, d in self.indeg.items():
@@ -86,8 +87,9 @@ class ModuleScheduler:
 
     # --- tasks
 
-    def _make_ready(self, m: str) -> None:
+    def _make_ready(self, m: str, now: float | None = None) -> None:
         self.state[m] = "ready"
+        self.ready_at[m] = now
         heapq.heappush(self.ready, (-self.bl[m], m))
 
     def _others_can(self, m: str, worker: str) -> bool:
@@ -135,14 +137,14 @@ class ModuleScheduler:
             for c in self.children[m]:
                 self.indeg[c] -= 1
                 if self.indeg[c] == 0 and self.state[c] == "waiting":
-                    self._make_ready(c)
+                    self._make_ready(c, now)
                     released.append(c)
             ev["released"] = len(released)
             return ev
         self.avoid[m].add(r.worker)
         self.errors[m].append(error[:500])
         if self.attempts[m] <= self.retries:
-            self._make_ready(m)
+            self._make_ready(m, now)
             ev["action"] = "retry"
         else:
             self.state[m] = "failed"

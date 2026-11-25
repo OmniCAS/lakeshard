@@ -24,11 +24,15 @@ def proj_and_ref(tmp_path, tc_bin):
 
 
 @pytest.mark.lean
-@pytest.mark.parametrize("storage", ["shared", "store"])
+@pytest.mark.parametrize("storage", ["store-http", "store-dir", "shared"])
 def test_direct_equals_lake_build(tmp_path, proj_and_ref, storage):
+    """store-http (default): workers keep their own build directories and reach the store only
+    through the coordinator's HTTP endpoints; store-dir: a store directory; shared: one build dir."""
     proj, ref = proj_and_ref
-    rep = api.build_direct(str(proj), str(tmp_path / "work"), workers=3, slots=2, threads=1, storage=storage,
-                           fail_once={"Synth.M7"})
+    kw = {"store-http": {}, "store-dir": {"store": str(tmp_path / "dirstore")},
+          "shared": {"storage": "shared"}}[storage]
+    rep = api.build_direct(str(proj), str(tmp_path / "work"), workers=3, slots=2, threads=1, fail_once={"Synth.M7"},
+                           **kw)
     assert rep["ok"], rep
     assert rep["modules_built"] == 40 and rep["slots"] == 6
     assert [f["module"] for f in rep["failures"]] == ["Synth.M7"]  # injected, then retried
@@ -36,16 +40,36 @@ def test_direct_equals_lake_build(tmp_path, proj_and_ref, storage):
     m7 = [e for e in events if e.get("event") == "result" and e["module"] == "Synth.M7"]
     assert [e["ok"] for e in m7] == [False, True] and m7[0]["worker"] != m7[1]["worker"]
     assert rep["lower_bound"]["bound_s"] > 0 and rep["lower_bound"]["ratio"] >= 1.0
-    if storage == "store":
-        asm = api.assemble(str(proj), rep["store"], str(tmp_path / "assembled"))
-        assert asm["ok"], asm
-        out_dir = tmp_path / "assembled"
-    else:
+    _check_records(tmp_path / "work" / "modules.jsonl", rep)
+    if storage == "store-http":
+        assert rep["store"].startswith("http://") and rep["store_server"]["objects_get"] > 0
+        assert rep["totals"]["fetched_bytes"] > 0
+        for w in ("w0", "w1", "w2"):  # no worker has a store of its own
+            assert not os.path.exists(tmp_path / "work" / "workers" / w / "store")
+    if storage == "shared":
         out_dir = rep["build_dir"]
         assert not os.listdir(os.path.join(out_dir, ".lakeshard-tmp"))  # temporary files cleaned up
+    else:
+        store = rep["store_root"] or rep["store"]
+        asm = api.assemble(str(proj), store, str(tmp_path / "assembled"))
+        assert asm["ok"], asm
+        out_dir = tmp_path / "assembled"
     ver = api.verify(str(proj), str(out_dir), reference=str(ref), leanchecker_jobs=4, lake_check=False)
     assert ver["compare"]["ok"] and ver["compare"]["identical_files"] == 120, ver["compare"]
     assert ver["leanchecker"]["ok"] and ver["leanchecker"]["ok_runs"] == 40, ver["leanchecker"]
+
+
+def _check_records(path, rep):
+    """One run record per attempt, times ordered on the coordinator's clock (same machine: offset 0)."""
+    recs = [json.loads(x) for x in open(path)]
+    assert len(recs) == rep["totals"]["attempts"] == 41
+    ok = [r for r in recs if r["ok"]]
+    assert len(ok) == 40 and len({r["module"] for r in ok}) == 40
+    for r in ok:
+        assert r["host"] and r["threads"] == 1 and r["slots"] == 2 and r["clock_offset_s"] == 0.0
+        assert r["ready_t"] <= r["dispatch_t"] <= r["start_t"] <= r["lean_start_t"] <= r["lean_end_t"]
+        assert r["lean_end_t"] <= r["end_t"] <= r["report_t"] + 1e-3 and r["report_t"] <= r["done_t"]
+        assert r["lean_s"] > 0 and r["cpu_s"] > 0 and r["max_rss_bytes"] > 0 and r["output_bytes"] > 0
 
 
 def _post(url, token, path, body):
@@ -85,5 +109,8 @@ def test_lost_worker_and_remote_style_worker(tmp_path, proj_and_ref):
     assert out["ok"], out
     assert {f["module"] for f in out["failures"]} == {x["module"] for x in lost}
     assert all(f.get("reason") == "worker lost" for f in out["failures"])
-    ver = api.verify(str(proj), out["build_dir"], reference=str(ref), lake_check=False)
+    assert out["store"].startswith("http://")  # the separately started worker used the HTTP store with the token
+    asm = api.assemble(str(proj), out["store_root"], str(tmp_path / "assembled"))
+    assert asm["ok"], asm
+    ver = api.verify(str(proj), str(tmp_path / "assembled"), reference=str(ref), lake_check=False)
     assert ver["compare"]["ok"] and ver["compare"]["identical_files"] == 120, ver["compare"]

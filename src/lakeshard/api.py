@@ -97,20 +97,24 @@ def build(project_dir: str, work_dir: str, workers: int = 2, threads: int = 0, p
 
 
 def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int = 3, threads: int = 0,
-                 storage: str = "shared", build_dir: str | None = None, store: str | None = None,
+                 storage: str = "store", build_dir: str | None = None, store: str | None = None,
                  history: str | None = None, retries: int = 2, timeout_s: float = 7200.0,
                  fail_once: set | None = None, toolchain: str | None = None, listen: str = "127.0.0.1:0",
                  local_workers: int | None = None, token_file: str | None = None,
                  visibility_timeout_s: float = 0.0, heavy_cost: float | None = None, heavy_threads: int = 0,
                  lease_s: float = 60.0, heartbeat_s: float = 5.0, keep_setup: bool = False,
-                 wait_timeout_s: float | None = None, python: str = sys.executable) -> dict:
+                 wait_timeout_s: float | None = None, python: str = sys.executable,
+                 advertise_host: str | None = None) -> dict:
     """Build every module with one `lean` process per module; workers pull tasks over HTTP.
 
     The coordinator runs in this process. `local_workers` (default `workers`) worker processes
     with `slots` slots each are started here; more can join from other machines with
     `lakeshard worker serve --coordinator URL --token-file FILE` (written to `<work>/coordinator.json`).
-    storage="shared": all workers write into `build_dir` (default `<work>/build`);
-    storage="store": every worker has its own build directory and outputs go through `store`.
+    storage="store" (default): every worker has its own build directory; outputs go through the
+    artifact store: served by the coordinator over HTTP from `<work>/store` when `store` is None,
+    a directory every worker can read and write when `store` is a path, or another store server
+    when `store` is an `http://` URL.
+    storage="shared": all workers write into `build_dir` (default `<work>/build`).
     """
     from .lakeenv import LakeWorkspace
     from .protocol import BuildConfig
@@ -123,7 +127,11 @@ def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int =
     work_dir = os.path.abspath(work_dir)
     os.makedirs(work_dir, exist_ok=True)
     build_dir = os.path.abspath(build_dir or os.path.join(work_dir, "build"))
-    store = os.path.abspath(store or os.path.join(work_dir, "store"))
+    store_root = None
+    if storage == "store" and not store:
+        store_root = os.path.join(work_dir, "store")  # served by the coordinator
+    elif store and not store.startswith(("http://", "https://")):
+        store = os.path.abspath(store)
     LakeWorkspace(proj, build_dir, tb).check_supported()  # refuse early
     for m in g.modules:
         if proj.lib_of(m) is None:
@@ -133,7 +141,7 @@ def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int =
     costs = estimate_costs(g, hist_in)
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
     cfg = BuildConfig(run_id, proj.project_dir, tb, storage, build_dir if storage == "shared" else "",
-                      store if storage == "store" else "", visibility_timeout_s, 0.5, heartbeat_s, keep_setup)
+                      (store or "") if storage == "store" else "", visibility_timeout_s, 0.5, heartbeat_s, keep_setup)
     sched = ModuleScheduler(g, costs, retries=retries, lease_s=lease_s, timeout_s=timeout_s,
                             heavy_cost=heavy_cost if heavy_cost is not None else float("inf"),
                             heavy_threads=heavy_threads, needs_closure=storage == "store", fail_once=fail_once)
@@ -146,7 +154,10 @@ def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int =
         with os.fdopen(fd, "w") as fh:
             fh.write(token + "\n")
     host, _, port = listen.rpartition(":")
-    svc = BuildService(g, sched, cfg, work_dir, token=token, host=host or "127.0.0.1", port=int(port or 0))
+    svc = BuildService(g, sched, cfg, work_dir, token=token, host=host or "127.0.0.1", port=int(port or 0),
+                       store_root=store_root, advertise_host=advertise_host)
+    if store_root:
+        cfg.store = svc.url  # workers reach the store through the coordinator
     svc.start()
     with open(os.path.join(work_dir, "coordinator.json"), "w", encoding="utf-8") as fh:
         json.dump({"url": svc.url, "token_file": token_file, "run_id": run_id, "project_dir": proj.project_dir,
@@ -170,7 +181,7 @@ def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int =
                  "--workspace", os.path.join(work_dir, "workers", wid)],
                 stdout=log, stderr=subprocess.STDOUT, env=env))
             log.close()
-        finished = svc.wait(wait_timeout_s)
+        finished = _wait_build(svc, sched, procs, wait_timeout_s)
         deadline = time.time() + 60
         for p in procs:  # they exit once they see `shutdown`
             try:
@@ -182,15 +193,36 @@ def build_direct(project_dir: str, work_dir: str, workers: int = 4, slots: int =
             if p.poll() is None:
                 p.kill()
         report = svc.report_dict()
+        report["run_records"] = os.path.join(work_dir, "modules.jsonl")
+        report["run_record_count"] = svc.write_records(report["run_records"])
         svc.stop()
     report.update({"finished": finished, "url": svc.url, "local_workers": n_local, "slots_per_worker": slots,
                    "threads_per_lean": threads, "retries": retries, "run_id": run_id,
-                   "worker_exit_codes": [p.returncode for p in procs]})
+                   "worker_exit_codes": [p.returncode for p in procs], "store_root": store_root})
     _write_history(hist_in, report.pop("module_seconds"), hist_out)
     report["history"] = hist_out
     with open(os.path.join(work_dir, "report.json"), "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=1)
     return report
+
+
+def _wait_build(svc, sched, procs: list, timeout_s: float | None) -> bool:
+    """Wait for the build; give up early when every local worker has exited and no other worker
+    is alive (otherwise a crashed set of workers would leave the coordinator waiting forever)."""
+    deadline = None if timeout_s is None else time.time() + timeout_s
+    dead_since = None
+    while True:
+        if svc.wait(1.0):
+            return True
+        if deadline is not None and time.time() > deadline:
+            return False
+        if procs and all(p.poll() is not None for p in procs):
+            with svc.cond:
+                others = any(w["alive"] for wid, w in sched.workers.items()
+                             if time.time() - w["last_seen"] < sched.lease_s)
+            dead_since = dead_since or time.time()
+            if not others and time.time() - dead_since > 2.0:
+                return False
 
 
 def check_setup(project_dir: str, lake_build_dir: str, toolchain: str | None = None, limit: int = 20) -> dict:

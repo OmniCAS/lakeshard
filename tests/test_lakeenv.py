@@ -117,6 +117,8 @@ def test_module_system_matches_lake(tmp_path):
     assert res["ok"] and res["checked_setup_files"] == 6, res
     rep = api.build_direct(str(proj), str(tmp_path / "work"), workers=2, slots=2)
     assert rep["ok"], rep
-    ver = api.verify(str(proj), rep["build_dir"], reference=str(tmp_path / "ref"), lake_check=False)
+    asm = api.assemble(str(proj), rep["store_root"], str(tmp_path / "assembled"))
+    assert asm["ok"], asm
+    ver = api.verify(str(proj), str(tmp_path / "assembled"), reference=str(tmp_path / "ref"), lake_check=False)
     # 4 module files x 7 outputs (.olean .olean.server .olean.private .ilean .ir .ir.sig .c) + 2 plain x 3
     assert ver["compare"]["ok"] and ver["compare"]["identical_files"] == 34, ver

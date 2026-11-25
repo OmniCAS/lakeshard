@@ -175,10 +175,43 @@ and stopped (priority changed to "first make it run"); they will be measured on 
 cross-machine form of S2. The direct backend writes no Lake `.trace`/`.hash` files, so
 `lake build --no-build` does not accept its build directory yet (S3).
 
+## Stage S2: per-worker build directories, artifact store over HTTP (one machine)
+
+The cross-machine form, simulated on one machine with worker processes that share no
+directories: every worker has its own build directory under its own workspace and sees the
+store only through HTTP (served by the coordinator from its work directory). The project source,
+the toolchain and the dependencies are at the same paths for all (as required on real machines).
+
+- Store interface with two implementations: directory (`LocalStore`) and HTTP (`HttpStore` client,
+  `StoreEndpoints` server, mounted in the coordinator or run alone with `lakeshard store serve`).
+  Uploads are hashed by the server and kept only if the hash matches; downloads are hashed by the
+  client; tampered objects, wrong names and missing tokens are refused (tests).
+- Workers use persistent HTTP connections: on one machine a round trip went from 7.6 ms (a new
+  connection per request) to 1.3-1.7 ms.
+- One run record per attempt (`modules.jsonl`, `docs/run-records.md`) with ready, dispatch, start,
+  `lean`, end, report and release times on the coordinator's clock (worker clocks converted with
+  a round-trip estimate; on one machine the estimate was off by 0.5 ms), fetch / compile / upload
+  durations, CPU, peak memory, host and threads.
+- A build whose local workers have all exited now stops instead of waiting (found when a broken
+  worker crashed on start and the coordinator waited indefinitely).
+
+| project (modules) | run | wall s | coordinator s | CPU s | slots | critical path s | work / slots s | bound s | wall / bound | files same / different / missing |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| synthetic (40) | `lake build` (S1 run) | 2.4 | - | 8 | 12 | 2.4 | 0.7 | 2.4 | 1.03 | - |
+| synthetic (40) | direct `lean`, own dirs + HTTP store, 4 x 3 slots | 3.1 | 2.5 | 9 | 12 | 2.4 | 0.7 | 2.4 | 1.31 | 120 / 0 / 0 |
+| synthetic (316) | `lake build` (S1 run) | 17.8 | - | 103 | 12 | 16.2 | 9.5 | 16.2 | 1.10 | - |
+| synthetic (316) | direct `lean`, own dirs + HTTP store, 4 x 3 slots | 17.7 | 17.1 | 101 | 12 | 16.1 | 8.6 | 16.1 | 1.10 | 948 / 0 / 0 |
+
+Transfers in the 316-module run (from `modules.jsonl`): workers fetched 2,997 files, 121 MB, in
+2.1 s in total (median 4 ms per task, at most 93 ms) and uploaded 948 files, 38 MB (median 5 ms
+per task); dispatch latency (coordinator hands out, worker starts) median 0.4 ms; release latency
+(worker done, importers released) median 0.8 ms. On one machine the HTTP store costs nothing
+visible; across machines the fetches grow with the import closure (each worker ends up holding
+most outputs), which is what S4 measures.
+
 ## Known limits and next steps
 
-S1 (direct backend) next: S2 per-worker local build directories with a store interface (shared
-directory and HTTP); S3 `run` (repository in, cache out) and `restore`, Lake traces for the direct
+Direct backend next: S3 `run` (repository in, cache out) and `restore`, Lake traces for the direct
 backend, Mathlib-style `lakefile.lean` projects; S4 three machines; S5 scale tests with fake
 workers. The items below are about the Lake batch backend.
 

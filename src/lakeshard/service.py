@@ -15,8 +15,13 @@ Endpoints (POST, JSON in and out; `Authorization: Bearer <token>` when a token i
 - `/v1/claim` `{worker, n, wait_s}` -> `{tasks: [ModuleTask], shutdown}` (waits up to `wait_s`)
 - `/v1/report` `{result: ModuleResult}` -> `{accepted}`; a successful result is accepted only
   after the coordinator sees the reported outputs (shared directory) or records (store)
-- `/v1/heartbeat` `{worker, running: [task ids]}` -> `{cancel: [task ids], shutdown}`
+- `/v1/heartbeat` `{worker, running: [task ids], time}` -> `{cancel: [task ids], shutdown}`
 - GET `/v1/status` -> counts
+- `/v1/store/...` when the coordinator also serves the artifact store (see `httpstore.py`)
+
+Every attempt is also kept as one run record (`records()`, written to `modules.jsonl`; format in
+`docs/run-records.md`): coordinator-side times, the worker's own timestamps converted to the
+coordinator's clock with an offset estimated from heartbeats, durations, CPU and memory.
 """
 from __future__ import annotations
 
@@ -29,6 +34,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .direct import wait_visible
+from .httpstore import StoreEndpoints, _discard_body
 from .project import ProjectGraph
 from .protocol import BuildConfig, ModuleResult, dumps, to_dict
 from .scheduler import ModuleScheduler, lower_bound
@@ -37,7 +43,8 @@ from .store import open_store
 
 class BuildService:
     def __init__(self, graph: ProjectGraph, scheduler: ModuleScheduler, config: BuildConfig, work_dir: str,
-                 token: str | None = None, host: str = "127.0.0.1", port: int = 0, claim_wait_cap_s: float = 30.0):
+                 token: str | None = None, host: str = "127.0.0.1", port: int = 0, claim_wait_cap_s: float = 30.0,
+                 store_root: str | None = None, advertise_host: str | None = None):
         self.g, self.s, self.cfg = graph, scheduler, config
         self.work = os.path.abspath(work_dir)
         os.makedirs(self.work, exist_ok=True)
@@ -54,7 +61,15 @@ class BuildService:
         self.totals = {"attempts": 0, "failed_attempts": 0, "stale_reports": 0, "lean_s": 0.0, "cpu_s": 0.0,
                        "max_rss_bytes": 0, "wait_s": 0.0, "fetch_s": 0.0, "fetched_bytes": 0, "publish_s": 0.0,
                        "confirm_s": 0.0, "output_bytes": 0}
-        self.store = open_store(config.store) if config.storage == "store" else None
+        # the coordinator may serve the store itself; then it confirms outputs from the directory
+        self.store_ep = StoreEndpoints(store_root) if store_root else None
+        self.store = None
+        if config.storage == "store":
+            self.store = self.store_ep.store if self.store_ep else open_store(config.store, token=token)
+        self.advertise_host = advertise_host
+        self.dispatched: dict[str, tuple[float, float | None]] = {}  # task id -> (dispatch t, ready t)
+        self.attempt_records: list[dict] = []
+        self.clock: dict[str, list[float]] = {}  # worker -> samples of (worker clock - coordinator clock)
         self._stop = threading.Event()
         svc = self
 
@@ -78,7 +93,31 @@ class BuildService:
                 got = self.headers.get("Authorization", "")
                 return hmac.compare_digest(got, f"Bearer {svc.token}")
 
+            def _store(self, method: str) -> bool:
+                if svc.store_ep is None or not svc.store_ep.handles(self.path):
+                    return False
+                if not self._authorized():
+                    _discard_body(self)
+                    self._reply(401, {"error": "unauthorized"})
+                    return True
+                try:
+                    svc.store_ep.handle(self, method)
+                except Exception as e:  # noqa: BLE001
+                    self._reply(500, {"error": f"{type(e).__name__}: {e}"})
+                return True
+
+            def do_HEAD(self):
+                if not self._store("HEAD"):
+                    self._reply(404, {"error": "not found"})
+
+            def do_PUT(self):
+                if not self._store("PUT"):
+                    _discard_body(self)
+                    self._reply(404, {"error": "not found"})
+
             def do_GET(self):
+                if self._store("GET"):
+                    return None
                 if not self._authorized():
                     return self._reply(401, {"error": "unauthorized"})
                 if self.path == "/v1/status":
@@ -86,7 +125,10 @@ class BuildService:
                 return self._reply(404, {"error": "not found"})
 
             def do_POST(self):
+                if self._store("POST"):
+                    return None
                 if not self._authorized():
+                    _discard_body(self)
                     return self._reply(401, {"error": "unauthorized"})
                 n = int(self.headers.get("Content-Length") or 0)
                 try:
@@ -106,7 +148,9 @@ class BuildService:
     @property
     def url(self) -> str:
         host, port = self.httpd.server_address[:2]
-        if host in ("0.0.0.0", "::"):
+        if self.advertise_host:
+            host = self.advertise_host
+        elif host in ("0.0.0.0", "::"):
             host = socket.gethostname()
         return f"http://{host}:{port}"
 
@@ -146,6 +190,12 @@ class BuildService:
                     self.totals["failed_attempts"] += 1
                     self.failures.append({k: ev.get(k) for k in ("module", "worker", "attempt", "reason")})
                     self._log({"event": "expired", **ev})
+                    disp, ready = self.dispatched.get(ev["task_id"], (None, None))
+                    self.attempt_records.append({
+                        "module": ev["module"], "attempt": ev["attempt"], "task_id": ev["task_id"], "ok": False,
+                        "accepted": True, "worker": ev["worker"], "reason": ev.get("reason"),
+                        "ready_t": self._rel(ready or self.t0), "dispatch_t": self._rel(disp),
+                        "done_t": self._rel(time.time())})
                 if evs:
                     self._mark_done()
                     self.cond.notify_all()
@@ -165,16 +215,27 @@ class BuildService:
     def register(self, body: dict) -> dict:
         wid = body["worker"]
         with self.cond:
-            self.s.register(wid, int(body.get("slots", 1)), time.time())
+            now = time.time()
+            self.s.register(wid, int(body.get("slots", 1)), now)
             self.worker_info[wid] = {"slots": int(body.get("slots", 1)), "threads": int(body.get("threads", 0)),
                                      "host": body.get("host", ""), "pid": body.get("pid"), "tasks": 0,
                                      "failed": 0, "lean_s": 0.0, "cpu_s": 0.0, "max_rss_bytes": 0}
             self._log({"event": "register", "worker": wid, "slots": body.get("slots"), "host": body.get("host")})
             self.cond.notify_all()
-        return {"config": self.cfg}
+        return {"config": self.cfg, "server_time": time.time()}
+
+    def _note_clock(self, body: dict) -> None:
+        """Keep the worker's own round-trip estimate of its clock offset (sent with claims and heartbeats)."""
+        if body.get("clock_offset") is not None:
+            self.clock[body["worker"]] = [float(body["clock_offset"])]
+            if body["worker"] in self.worker_info:
+                self.worker_info[body["worker"]]["clock_rtt_s"] = body.get("clock_rtt")
+                self.worker_info[body["worker"]]["clock_offset_estimate_s"] = float(body["clock_offset"])
 
     def claim(self, body: dict) -> dict:
         wid, n = body["worker"], max(0, int(body.get("n", 1)))
+        with self.cond:
+            self._note_clock(body)
         deadline = time.time() + min(float(body.get("wait_s", 0.0)), self.claim_wait_cap_s)
         with self.cond:
             while True:
@@ -182,9 +243,13 @@ class BuildService:
                     return {"tasks": [], "shutdown": True}
                 tasks = self.s.claim(wid, n, time.time()) if n else []
                 if tasks:
+                    now = time.time()
                     for t in tasks:
+                        ra = self.s.ready_at.get(t.module)
+                        self.dispatched[t.task_id] = (now, ra)
                         self._log({"event": "dispatch", "task_id": t.task_id, "module": t.module, "worker": wid,
-                                   "attempt": t.attempt, "threads": t.threads})
+                                   "attempt": t.attempt, "threads": t.threads,
+                                   "ready_t": round((ra or self.t0) - self.t0, 3)})
                     return {"tasks": tasks, "shutdown": False}
                 left = deadline - time.time()
                 if left <= 0:
@@ -193,8 +258,10 @@ class BuildService:
 
     def heartbeat(self, body: dict) -> dict:
         with self.cond:
-            cancel = self.s.heartbeat(body["worker"], list(body.get("running", [])), time.time())
-            return {"cancel": cancel, "shutdown": self.s.done()}
+            now = time.time()
+            self._note_clock(body)
+            cancel = self.s.heartbeat(body["worker"], list(body.get("running", [])), now)
+            return {"cancel": cancel, "shutdown": self.s.done(), "server_time": time.time()}
 
     def _confirm(self, res: ModuleResult) -> str:
         """'' if the outputs are visible to the coordinator, else the reason."""
@@ -214,8 +281,9 @@ class BuildService:
 
     def report(self, body: dict) -> dict:
         res = ModuleResult.from_dict(body["result"])
+        t_report = time.time()
         with self.cond:  # a report is a sign of life; its task must not expire while we check outputs
-            self.s.touch(res.worker, time.time())
+            self.s.touch(res.worker, t_report)
             live = res.task_id in self.s.running and self.s.running[res.task_id].worker == res.worker
             if live:
                 self.s.confirming.add(res.task_id)
@@ -240,6 +308,7 @@ class BuildService:
                 self.totals["stale_reports"] += 1
             else:
                 self._account(res, confirm_s)
+            self._record(res, t_report, time.time(), confirm_s, ev is not None)
             self._mark_done()
             self.cond.notify_all()
         return {"accepted": ev is not None}
@@ -268,6 +337,47 @@ class BuildService:
             self.failures.append({"module": res.module, "worker": res.worker, "attempt": res.attempt,
                                   "error": res.error[:500]})
 
+    # --- run records
+
+    def _rel(self, t: float | None) -> float | None:
+        return None if t is None else round(t - self.t0, 4)
+
+    def clock_offset(self, worker: str) -> float:
+        """Worker clock - coordinator clock, as estimated by the worker from its lowest-latency
+        register/heartbeat round trip (error at most half that round trip); 0 if unknown."""
+        if self.worker_info.get(worker, {}).get("host") == socket.gethostname():
+            return 0.0  # same machine, same clock
+        xs = self.clock.get(worker, [])
+        return xs[-1] if xs else 0.0
+
+    def _record(self, res: ModuleResult, t_report: float, t_done: float, confirm_s: float, accepted: bool) -> None:
+        off = self.clock_offset(res.worker)
+        disp, ready = self.dispatched.get(res.task_id, (None, None))
+        w = lambda t: self._rel(t - off) if t else None  # noqa: E731 - worker clock -> coordinator clock
+        self.attempt_records.append({
+            "module": res.module, "attempt": res.attempt, "task_id": res.task_id, "ok": res.ok, "accepted": accepted,
+            "worker": res.worker, "host": res.host, "threads": res.threads,
+            "slots": self.worker_info.get(res.worker, {}).get("slots"),
+            "ready_t": self._rel(ready or self.t0), "dispatch_t": self._rel(disp), "start_t": w(res.started),
+            "lean_start_t": w(res.lean_start), "lean_end_t": w(res.lean_end), "end_t": w(res.ended),
+            "report_t": self._rel(t_report), "done_t": self._rel(t_done),
+            "wall_s": round(res.wall_s, 4), "wait_s": round(res.wait_s, 4), "fetch_s": round(res.fetch_s, 4),
+            "lean_s": round(res.lean_s, 4), "publish_s": round(res.publish_s, 4), "confirm_s": round(confirm_s, 4),
+            "cpu_s": round(res.cpu_s, 3), "max_rss_bytes": res.max_rss_bytes, "fetched_files": res.fetched_files,
+            "fetched_bytes": res.fetched_bytes, "output_bytes": sum(f.size for f in res.outputs),
+            "clock_offset_s": round(off, 4), "error": res.error[:300]})
+
+    def records(self) -> list[dict]:
+        with self.cond:
+            return list(self.attempt_records)
+
+    def write_records(self, path: str) -> int:
+        recs = self.records()
+        with open(path, "w", encoding="utf-8") as fh:
+            for r in recs:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        return len(recs)
+
     # --- results
 
     def status(self) -> dict:
@@ -288,5 +398,8 @@ class BuildService:
                     "storage": self.cfg.storage, "build_dir": self.cfg.build_dir, "store": self.cfg.store,
                     "wall_s": round(wall, 2), "modules": len(self.g.modules), "status": counts,
                     "modules_built": counts.get("done", 0), "slots": slots, "lower_bound": lb, "totals": tt,
-                    "workers": self.worker_info, "failures": self.failures[:100],
+                    "workers": {w: dict(i, clock_offset_s=round(self.clock_offset(w), 4))
+                                for w, i in self.worker_info.items()},
+                    "store_server": dict(self.store_ep.stats) if self.store_ep else None,
+                    "failures": self.failures[:100],
                     "module_seconds": dict(self.module_seconds)}
