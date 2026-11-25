@@ -438,8 +438,20 @@ Dispatch and placement, wide, 2 x 16 cores unless noted (relative to critical pa
   are to be repeated with it.
 - First ready first on Mathlib, 2 x 16 cores: 1,766 s, 10 % slower than critical path first
   (all but the root module done at 1,521 s against 1,352 s, 12.5 % slower).
-- The one-machine `lake build` of the wide instance on the hub lost its timing (the harness's SSH
-  session dropped; about 13 minutes by file times) and is repeated at the end of the queue.
+- Stock `lake build` on the hub, 16 threads: wide 697 s (lakeshard: one machine 671, two 359, i.e.
+  1.94 times Lake), narrow 440 s, all of Mathlib 2,775 s (46.3 min; lakeshard one machine 2,713,
+  two 1,606, i.e. 1.73 times Lake). The first wide `lake build` lost its timing (the harness's SSH
+  session dropped) and was repeated.
+- Outputs against stock `lake build` (each kept store assembled into one build directory, then
+  compared file by file): wide 12,999 / 12,999 and narrow 7,839 / 7,839 identical; Mathlib
+  59,707 / 59,710, the 3 others being the `.olean`, `.olean.private` and `.olean.server` of one
+  module, `Mathlib.Combinatorics.SimpleGraph.Walk.Operations`. Lean itself does not reproduce that
+  module: compiled four times against the same `lake build` (same setup file, same `LEAN_PATH`),
+  it gave three different `.olean` hashes (two runs with one thread differ from each other and
+  from Lake's), while `.c`, `.ilean` and `.ir` never changed. So "identical to Lake" has to
+  exclude modules that plain Lean does not reproduce, found by compiling them twice.
+  (`lake build --no-build` rejects an assembled directory because it has no traces; Lake's
+  acceptance is checked on sealed builds, stage S3.)
 
 ## Known limits and next steps
 
