@@ -339,13 +339,17 @@ numbering was topological and underestimated CP 2.3 times; it is kept as a third
 | wide | `lake build`, one machine, 16 threads | 570 | - | - | 1.00 | |
 | wide | lakeshard, one machine, critical path first | 564 | 1.05 | 0.27 | 1.01 | |
 | wide | lakeshard, three machines, critical path first | 249 | 1.25 | 0.81 | 2.29 | **2.27 (2.2-2.6)** |
-| wide | three machines, first ready first | 290 | 1.44 | | 1.97 | critical path first 14 % faster (predicted 10-25 %) |
+| wide | three machines, first ready first | 290 | 1.44 | | 1.97 | 17 % slower than critical path first, i.e. critical path first 14 % faster (predicted 10-25 %) |
 | wide | three machines, priorities from graph structure only | 273 | 1.37 | | 2.09 | 10 % slower than measured costs (predicted < 2 %; one run) |
 | wide | three machines, fixed split by directory (106 blocks, balanced) | 327 | 1.68 | | 1.74 | 31 % slower than dynamic (predicted > 20 %) |
 | medium | `lake build`, one machine | 733 | - | - | 1.00 | |
 | medium | lakeshard, one machine | 773 | 1.15 | 0.51 | 0.95 | (another user's jobs loaded that machine) |
 | medium | lakeshard, three machines | 419 | 1.09 | 1.52 | 1.75 | 1.84 (theory for the measured x: about 1.85) |
 
+- "wall s" is the build's own time on the machine: for `lake build` the `lake` process (570 and
+  733 s), for lakeshard the coordinator from start to the last result, worker start-up included.
+  The harness's elapsed times also count SSH, setup and collection (`lake build`: 586 and 750 s;
+  run records: `meta.json` fields `result.wall_s` and `elapsed_s`).
 - Outputs of the three-machine runs are identical to `lake build` (wide: 12,999 / 12,999 files) and
   to the one-machine run (medium: 9,468 / 9,468); the store holds 5.8 GB (wide).
 - The same module takes 1.27 and 1.07 times longer on the second and third machine than on the
@@ -359,6 +363,45 @@ numbering was topological and underestimated CP 2.3 times; it is kept as a third
   1,064 s: 2,047 of 4,333 modules done, only 12 of 48 slots busy with 248 modules ready, all pinned
   to busy machines) but the run is void: the hub's root file system went read-only during it.
   The remaining configurations run on the two other machines.
+
+### Two machines x c cores (one run each)
+
+The hub machine also runs every one-machine configuration; the second machine only connects.
+Third instance: narrow, 2,613 modules, W 1,748 core-s, CP 382 s, W / CP 4.6 (Lake's own times:
+1,960 and 387). Predictions are the research notes' two-machine model, made before these runs.
+
+| instance | cores per machine | one machine s | two machines s | two vs one (predicted) | x, two machines | wall / bound |
+|---|---:|---:|---:|---:|---:|---:|
+| wide | 16 | 671 | 359 | 1.87 (2.04) | 0.55 | 1.21 |
+| wide | 8 | 1,316 | 675 | 1.95 (2.09) | 0.27 | 1.15 |
+| wide | 4 | 2,504 | 1,305 | 1.92 (2.11) | 0.14 | 1.12 |
+| narrow | 16 | 439 (`lake build`: 440) | 439 | 1.00 (1.03) | 7.2 | 1.16 |
+| narrow | 4 | 689 | 540 | 1.28 (1.26) | 1.8 | 1.40 |
+
+Dispatch and placement, wide, 2 x 16 cores unless noted (relative to critical path first, 359 s):
+
+| configuration | wall s | slower by (predicted) |
+|---|---:|---|
+| first ready first | 442 | 23 % (13 %) |
+| first ready first, 2 x 4 cores | 1,332 | 2 % against 1,305 (2 %) |
+| priorities from graph structure only | 383 | 7 % (8 %) |
+| fixed split by directory | 423 | 18 % (5 %) |
+| fixed split along import chains | 360 | 0 % (7 %) |
+| +0.1 s on every artifact fetch | 370 | 3 % |
+
+- The narrow instance is the counterexample the theory predicts: at x = 7 the critical path
+  decides and a second machine gains nothing (79 % of slot time idle with nothing ready); with
+  4 cores per machine (x = 1.8) it gains 1.28.
+- Per-machine speed (median of a module's `lean` time against the one-machine run on the hub):
+  hub 0.98-1.01, second machine 0.92-0.99, so this second machine is a little faster than the hub
+  (which carried other users' jobs); total work on two machines is between 4 % smaller and 1 %
+  larger than on one.
+- Wide, 2 x 16: 82 % of slot time runs `lean`, 2.3 % idle while a module was ready, 3.7 % idle
+  with nothing ready, 13 s before the first module starts. First ready first: 15 % idle with
+  nothing ready (the critical path is started late). Fixed split by directory: 14 % idle while a
+  module was ready (ready modules wait for their machine).
+- The one-machine `lake build` of the wide instance on the hub lost its timing (the harness's SSH
+  session dropped; about 13 minutes by file times) and is repeated at the end of the queue.
 
 ## Known limits and next steps
 
