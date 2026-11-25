@@ -445,7 +445,10 @@ def reference_build(project_dir: str, build_dir: str, threads: int = 0, toolchai
         json.dump(secs, fh, indent=0, sort_keys=True)
     with open(base + ".log", "w", encoding="utf-8") as fh:  # full Lake output, for later analysis
         fh.write(out)
-    return {"ok": code == 0, "exit": code, "wall_s": round(wall, 2), "cpu_s": round(cpu, 2),
-            "max_rss_bytes": rss, "threads": threads, "build_dir": os.path.abspath(build_dir),
-            "modules_built": len(secs), "module_seconds_sum": round(sum(secs.values()), 2), "history": hist,
-            "output_tail": "\n".join(out.strip().splitlines()[-3:]), "started": t0}
+    res = {"ok": code == 0, "exit": code, "wall_s": round(wall, 2), "cpu_s": round(cpu, 2),
+           "max_rss_bytes": rss, "threads": threads, "build_dir": os.path.abspath(build_dir),
+           "modules_built": len(secs), "module_seconds_sum": round(sum(secs.values()), 2), "history": hist,
+           "output_tail": "\n".join(out.strip().splitlines()[-3:]), "started": t0}
+    with open(base + ".json", "w", encoding="utf-8") as fh:  # also on disk (for callers that lose stdout)
+        json.dump(res, fh, indent=1)
+    return res
