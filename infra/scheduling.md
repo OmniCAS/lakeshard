@@ -57,10 +57,44 @@ worker 是和别人共用的机器。示例环境用 kubelet 的 `system-reserve
 
 沙箱里的命令和文件操作都经过一个运行时入口网关（反向代理到各沙箱里的执行代理）。它只有一个副本时就是单点：所在节点被驱逐或宕机，所有实例的命令和文件操作都会失败。
 
-- 副本数 ≥ 3，每个 worker 一个：用 `topologySpreadConstraints`，`topologyKey: kubernetes.io/hostname`，`maxSkew: 1`，`whenUnsatisfiable: DoNotSchedule`。
+- 副本数 ≥ 3，每个 worker 一个：用 `topologySpreadConstraints`，`topologyKey: kubernetes.io/hostname`，`maxSkew: 1`，`whenUnsatisfiable: DoNotSchedule`，并加上 `matchLabelKeys: [pod-template-hash]`。
+  - 不加后者时，滚动更新期间还在退出的旧副本也会被算进去。示例环境里第一次滚动的结果是两个新副本落在同一台、另一台一个都没有，补上它再滚一次才均匀。
 - 加一个 `PodDisruptionBudget`，`minAvailable: 2`。
 - 它的 `nodeSelector` 和沙箱用同一组标签，这样不会落到池外节点。
 - 改模板会触发滚动更新：先起新的再停旧的，但旧副本上正在进行的长连接会断，所以要在没有活动实例时改。
 - 如果网关的 Deployment 由部署工具生成，要把同样的设置写回部署源，否则下次部署会被改回去。
 
 注意先后顺序：先解除节点的磁盘压力，再加按主机名打散的约束。新版 K8s 计算打散时默认把带污点的节点也算进去，节点还带污点时新副本会一直 Pending。
+
+## 出站：沙箱能连到哪里
+
+只有入站策略时，沙箱的出站是全开的。示例环境实测，从沙箱里能建立 TCP 连接的有：
+
+- hub 的 K8s API；
+- 集群内的 kubernetes 服务；
+- 共享盘 NFS 服务器的 2049、111 端口；
+- worker 节点的 SSH 和 kubelet 端口。
+
+只有平台自己的服务被入站策略挡住。共享盘按 UID 认人（`sec=sys`），这是最大的暴露面：不可信代码可以用用户态 NFS 客户端冒充任意 UID，能否得手取决于服务器是否要求特权源端口。
+
+建议加一条出站策略（K8s NetworkPolicy，`policyTypes: [Egress]`）：
+
+- 允许集群 DNS；
+- 允许公网（`0.0.0.0/0` 减去内网网段）；
+- 拒绝节点网段、存储网段、hub 和集群服务网段；
+- 构建任务确实需要访问的内网服务（例如产物库），单独按 IP 和端口放行。
+
+改之前先确认现有调用方没有依赖内网访问。
+
+## 节点之间的网络
+
+示例环境三台 worker 之间：
+
+| 项 | 实测 |
+| --- | --- |
+| 往返时间 | 约 0.2 ms |
+| 10 GbE 直连 TCP 吞吐 | 7.1–9.1 Gbit/s |
+| 1 GbE 管理网 | 0.91 Gbit/s |
+| 防火墙 | worker-1 不接受另外两台连入的高位端口，另外两台可以 |
+
+跨机传产物或开协调端口前，先逐对测一遍连通性，不要假设节点之间全通。
