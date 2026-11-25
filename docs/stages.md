@@ -387,7 +387,12 @@ Dispatch and placement, wide, 2 x 16 cores unless noted (relative to critical pa
 | priorities from graph structure only | 383 | 7 % (8 %) |
 | fixed split by directory | 423 | 18 % (5 %) |
 | fixed split along import chains | 360 | 0 % (7 %) |
-| +0.1 s on every artifact fetch | 370 | 3 % |
+| +0.1 s on every task that fetches imports | 370 | 3 % |
+| +1 s on every task that fetches imports | 406 | 13 % |
+| fixed split by directory, +1 s per fetching task | 440 | 23 % (8 % against the dynamic run with the same delay) |
+| +10 s on every task that fetches imports | 894 | 149 % |
+| fixed split by directory, +10 s per fetching task | 580 | 62 % (35 % faster than the dynamic run with the same delay) |
+| control: stock `lake build`, its `lean` commands forwarded to both machines, build directory on NFS | 909 | 153 % (35 % slower than lakeshard on one machine) |
 
 - The narrow instance is the counterexample the theory predicts: at x = 7 the critical path
   decides and a second machine gains nothing (79 % of slot time idle with nothing ready); with
@@ -400,6 +405,23 @@ Dispatch and placement, wide, 2 x 16 cores unless noted (relative to critical pa
   with nothing ready, 13 s before the first module starts. First ready first: 15 % idle with
   nothing ready (the critical path is started late). Fixed split by directory: 14 % idle while a
   module was ready (ready modules wait for their machine).
+- Fetch delay (`--fetch-delay`, a stand-in for a slower network): with dynamic dispatch 1,524 of
+  4,333 tasks fetch imports from the other machine (6.1 GB); one extra second each costs 1,524
+  slot-s, i.e. 48 s of wall time on 32 slots, and the run took 47 s longer. The directory split
+  keeps one machine's blocks free of the other's outputs: only 193 tasks fetch (3.5 GB, all on
+  the hub), so the delay cost it 17 s and its gap to dynamic dispatch shrank from 18 % to 8 %.
+  At 10 s per fetching task the fixed split wins, as predicted before the run (dynamic about
+  835 s, split 500-550 s; measured 894 and 580): 1,441 against 159 fetching tasks, and in the
+  dynamic run the delay also lengthens the critical path. Dispatch that ignores where the
+  imports are is right on a fast network only; with slow transfers placement must count them.
+- The forwarding control (`lakeshard forward`, distcc-style; Lake schedules, 32 commands allowed
+  in flight) took 909 s: every module's `lean` took about 1 s longer (median; 1.40-1.48 times
+  for modules over 1 s) because imports are read over NFS, so total work was 14,551 core-s
+  against 9,447 with per-machine directories (+54 %); and Lake kept a median of only 18 commands
+  in flight, never 32, although the graph is wide, so half of the slot time was idle (Lake's
+  own work on the NFS build directory, hashing outputs and writing traces, is the likely cause;
+  not measured separately). Waiting for files to become visible over NFS took 0.02 s per command
+  (median). Outputs per machine plus an artifact store are 2.5 times faster on the same machines.
 - The one-machine `lake build` of the wide instance on the hub lost its timing (the harness's SSH
   session dropped; about 13 minutes by file times) and is repeated at the end of the queue.
 
