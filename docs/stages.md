@@ -383,12 +383,12 @@ request). Second and third rounds, with the fix, same machines and settings (rou
 
 | instance | cores per machine | one machine s | two machines s | two vs one (predicted) | wall / bound, two machines |
 |---|---:|---:|---:|---:|---:|
-| wide | 16 | 635 / 638 | 329 / 328 | 1.93 / 1.95 (2.04) | 1.10 / 1.08 |
+| wide | 16 | 635 / 638 | 329 / 328 | 1.93 / 1.95 (2.04) | 1.10 / 1.09 |
 | wide | 8 | 1,214 / 1,220 | 627 / 621 | 1.94 / 1.96 (2.09) | 1.05 |
 | wide | 4 | 2,370 / 2,370 | 1,196 / 1,195 | 1.98 / 1.98 (2.11) | 1.03 |
-| narrow | 16 | 461 / 458 | 439 / 401 | 1.05 / 1.14 (1.03) | 1.04 |
-| narrow | 4 | 671 / 669 | 486 / 482 | 1.38 / 1.39 (1.26) | 1.25 |
-| all of Mathlib | 16 | 2,784 / 2,805 | 1,379 / 1,359 | 2.02 / 2.06 (two machines: about 19 min; measured 23.0 / 22.7) | 1.07 |
+| narrow | 16 | 461 / 458 | 439 / 401 | 1.05 / 1.14 (1.03) | 1.04 / 1.05 |
+| narrow | 4 | 671 / 669 | 486 / 482 | 1.38 / 1.39 (1.26) | 1.25 / 1.26 |
+| all of Mathlib | 16 | 2,784 / 2,805 | 1,379 / 1,359 | 2.02 / 2.06 (two machines: about 19 min; measured 23.0 / 22.7) | 1.07 / 1.06 |
 
 Stock `lake build` on the hub, 16 threads, three runs each: wide 697 / 662 s (the first lost its
 timing), narrow 440 / 474 / 544 s, all of Mathlib 2,775 / 2,908 / 3,102 s. Two machines with
@@ -399,9 +399,10 @@ lakeshard are 2.0-2.1 times faster than stock Lake on the wide instance and 2.0-
   changed; lakeshard's one-machine runs of the same day varied by under 1 %.
 - The fix took 5-8 % off the wide runs on either one or two machines and 14 % off Mathlib on two
   (where the transfers were on the critical path).
-- Wide stays 5-7 % below the predicted ratios; narrow with 4 cores per machine is 10 % above. At
-  x = 7 (narrow, 16 cores) the third round's 1.14 is not parallelism: the second machine is 11 %
-  faster, and in that run more of the critical path ran there.
+- Wide stays 4-7 % below the predicted ratios; narrow with 4 cores per machine is 10 % above. At
+  x = 7 (narrow, 16 cores) the third round's 1.14 is not parallelism: one module is 324-361 s of
+  the 384-420 s critical path, and in that round it ran on the second machine (325 s, against
+  361 s on the hub in round 2).
 
 Dispatch and placement, wide, 2 x 16 cores unless noted (relative to critical path first, 359 s):
 
