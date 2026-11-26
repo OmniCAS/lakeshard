@@ -379,19 +379,29 @@ Third instance: narrow, 2,613 modules, W 1,748 core-s, CP 382 s, W / CP 4.6 (Lak
 | narrow | 4 | 689 | 540 | 1.28 (1.26) | 1.8 | 1.40 |
 
 The table above is the first round, before the servers' Nagle fix (below: about 40 ms per store
-request). Second round, with the fix, same machines and settings:
+request). Second and third rounds, with the fix, same machines and settings (round 2 / round 3):
 
 | instance | cores per machine | one machine s | two machines s | two vs one (predicted) | wall / bound, two machines |
 |---|---:|---:|---:|---:|---:|
-| wide | 16 | 635 | 329 | 1.93 (2.04) | 1.10 |
-| wide | 8 | 1,214 | 627 | 1.94 (2.09) | 1.05 |
-| wide | 4 | 2,370 | 1,196 | 1.98 (2.11) | 1.03 |
-| narrow | 16 | 461 | 439 | 1.05 (1.03) | 1.04 |
-| narrow | 4 | 671 | 486 | 1.38 (1.26) | 1.25 |
-| all of Mathlib | 16 | 2,784 | 1,379 | 2.02 (19 min predicted for two machines; 23.0 measured) | 1.07 |
+| wide | 16 | 635 / 638 | 329 / 328 | 1.93 / 1.95 (2.04) | 1.10 / 1.08 |
+| wide | 8 | 1,214 / 1,220 | 627 / 621 | 1.94 / 1.96 (2.09) | 1.05 |
+| wide | 4 | 2,370 / 2,370 | 1,196 / 1,195 | 1.98 / 1.98 (2.11) | 1.03 |
+| narrow | 16 | 461 / 458 | 439 / 401 | 1.05 / 1.14 (1.03) | 1.04 |
+| narrow | 4 | 671 / 669 | 486 / 482 | 1.38 / 1.39 (1.26) | 1.25 |
+| all of Mathlib | 16 | 2,784 / 2,805 | 1,379 / 1,359 | 2.02 / 2.06 (two machines: about 19 min; measured 23.0 / 22.7) | 1.07 |
 
-The fix took 5-10 % off the wide runs on either one or two machines and 14 % off Mathlib on two
-(where the transfers were on the critical path); the third round is running.
+Stock `lake build` on the hub, 16 threads, three runs each: wide 697 / 662 s (the first lost its
+timing), narrow 440 / 474 / 544 s, all of Mathlib 2,775 / 2,908 / 3,102 s. Two machines with
+lakeshard are 2.0-2.1 times faster than stock Lake on the wide instance and 2.0-2.3 times on Mathlib.
+
+- Repetitions agree within 1 % for lakeshard on the wide instance and 1.5 % on Mathlib; stock Lake
+  varied by up to 24 % (narrow) and 12 % (Mathlib) over the day, as other users' load on the hub
+  changed; lakeshard's one-machine runs of the same day varied by under 1 %.
+- The fix took 5-8 % off the wide runs on either one or two machines and 14 % off Mathlib on two
+  (where the transfers were on the critical path).
+- Wide stays 5-7 % below the predicted ratios; narrow with 4 cores per machine is 10 % above. At
+  x = 7 (narrow, 16 cores) the third round's 1.14 is not parallelism: the second machine is 11 %
+  faster, and in that run more of the critical path ran there.
 
 Dispatch and placement, wide, 2 x 16 cores unless noted (relative to critical path first, 359 s):
 
